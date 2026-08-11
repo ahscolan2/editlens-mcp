@@ -14,7 +14,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from editlens_mcp.detector import clean_text, clean_text_with_map, map_span  # noqa: E402
+from editlens_mcp.detector import (  # noqa: E402
+    clean_text,
+    clean_text_with_map,
+    map_span,
+    split_units,
+)
 
 PY = sys.executable
 SCRIPT = str(Path(__file__).resolve().parent.parent / "run_server.py")
@@ -91,6 +96,75 @@ def test_server_offsets_index_original():
     assert not wbad, f"{len(wbad)} worst_spans misaligned"
 
 
+def test_spans_tile_the_original_exactly():
+    """Character-exact coverage, not word-level.
+
+    Comparing with .split() masks a missing newline, so the CRLF truncation bug
+    (span ending at the \\r instead of after the \\n) survived every earlier
+    assertion. Units tile the cleaned text contiguously, so their mapped spans
+    must tile the original contiguously too -- any truncation opens a gap.
+    """
+    cleaned, ranges = clean_text_with_map(MESSY)
+    units = split_units(cleaned, "sentence", 1)
+    mapped = [map_span(ranges, a, b, len(MESSY)) for a, b in units]
+
+    for (a0, a1), (b0, b1) in zip(mapped, mapped[1:]):
+        assert a1 == b0, f"gap/overlap in original coordinates: {a1} -> {b0}"
+
+    # Every character between the first and last span must be accounted for.
+    covered = MESSY[mapped[0][0]:mapped[-1][1]]
+    assert covered == "".join(MESSY[s:e] for s, e in mapped), "spans do not tile"
+
+    # And the untouched head/tail is whitespace only (what strip() removed).
+    assert not MESSY[:mapped[0][0]].strip()
+    assert not MESSY[mapped[-1][1]:].strip()
+    print(f"  {len(mapped)} spans tile chars {mapped[0][0]}..{mapped[-1][1]} exactly")
+
+
+def test_ranges_are_contiguous():
+    """Consecutive cleaned chars must map to consecutive source ranges.
+
+    Every source character has to belong to some cleaned character's range,
+    including whitespace that cleaning dropped. A gap means those characters are
+    unaccounted for, and a span ending at one silently loses them.
+    """
+    cases = [
+        "x  \na",                       # trailing spaces before a newline
+        "a\t\t\nb",                     # trailing tabs
+        "one   \r\n   two",             # both sides of a CRLF
+        "p  \nq",             # non-breaking spaces
+        "line   \n\n\n\n   next",       # dropped run plus collapsed blank lines
+        "solo",                         # nothing to drop
+        "a \n b \n c",
+    ]
+    for text in cases:
+        cleaned, ranges = clean_text_with_map(text)
+        if not cleaned:
+            continue
+        for i, ((_, e), (s, _)) in enumerate(zip(ranges, ranges[1:])):
+            assert e == s, (
+                f"{text!r}: gap between range {i} and {i + 1}: ends {e}, next starts {s} "
+                "-- source characters unmapped")
+        assert ranges[0][0] >= 0 and ranges[-1][1] <= len(text)
+    print(f"  {len(cases)} inputs: source ranges contiguous, nothing unmapped")
+
+
+def test_crlf_span_keeps_both_characters():
+    """A span whose cleaned form ends in \\n must include the full \\r\\n."""
+    text = "First line with CRLF.\r\nSecond line with CRLF.\r\nThird line here."
+    cleaned, ranges = clean_text_with_map(text)
+    end = cleaned.index("\n") + 1
+    o0, o1 = map_span(ranges, 0, end, len(text))
+    sliced = text[o0:o1]
+    assert cleaned[:end].endswith("\n")
+    assert sliced.endswith("\r\n"), (
+        f"span truncated mid-CRLF: {sliced!r} -- splicing here orphans a newline")
+    # Splicing must reconstruct the document without loss.
+    spliced = text[:o0] + "REPLACED\r\n" + text[o1:]
+    assert spliced == "REPLACED\r\nSecond line with CRLF.\r\nThird line here.", spliced
+    print(f"  CRLF span = {sliced!r}; splice reconstructs cleanly")
+
+
 def test_clean_text_offsets_unchanged_when_text_is_already_clean():
     tidy = "One sentence here. Another sentence follows. A third one closes it."
     cleaned, imap = clean_text_with_map(tidy)
@@ -103,6 +177,9 @@ if __name__ == "__main__":
     print("offset tests")
     test_map_agrees_with_clean_text()
     test_map_span_round_trip()
+    test_spans_tile_the_original_exactly()
+    test_ranges_are_contiguous()
+    test_crlf_span_keeps_both_characters()
     test_clean_text_offsets_unchanged_when_text_is_already_clean()
     test_server_offsets_index_original()
     print("OFFSET TESTS PASSED")
