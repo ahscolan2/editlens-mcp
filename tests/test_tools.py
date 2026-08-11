@@ -3,7 +3,7 @@ from pathlib import Path
 
 tmp = tempfile.mkdtemp()
 os.environ["EDITLENS_DB"] = str(Path(tmp) / "rt.db")
-sys.path.insert(0, r"C:\Users\Aryan\MCP-EditLens")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastmcp import Client
 from editlens_mcp import server

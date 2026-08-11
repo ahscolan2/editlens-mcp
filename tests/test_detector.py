@@ -6,7 +6,7 @@ from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp())
 os.environ["EDITLENS_DB"] = str(TMP / "v.db")
-sys.path.insert(0, r"C:\Users\Aryan\MCP-EditLens")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from editlens_mcp.detector import EditLensDetector, count_words
 

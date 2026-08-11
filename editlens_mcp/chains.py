@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -24,12 +25,21 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DEFAULT_DB = Path(
-    os.environ.get(
-        "EDITLENS_DB",
-        Path(os.environ.get("LOCALAPPDATA", Path.home())) / "editlens-mcp" / "chains.db",
-    )
-)
+def default_db_path() -> Path:
+    """Per-platform application-data location for the chain database."""
+    override = os.environ.get("EDITLENS_DB")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "editlens-mcp" / "chains.db"
+
+
+DEFAULT_DB = default_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chains (

@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import os
 import re
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -68,11 +69,26 @@ def warmup_imports() -> str | None:
             AutoTokenizer,
         )
 
-        torch.cuda.is_available()  # force CUDA probe here too
-    except Exception as exc:  # noqa: BLE001 - reported through detector_info
+        pick_device(torch)  # force the accelerator probe here too
+    except Exception as exc:  # noqa: BLE001 - surfaced via detector_info
         _warmup_error = f"{type(exc).__name__}: {exc}"
     _warmed = True
     return _warmup_error
+
+
+def pick_device(torch) -> str:
+    """CUDA, else Apple Silicon (Metal), else CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available() and mps.is_built():
+        return "mps"
+    return "cpu"
+
+
+def accelerator_of(device: str) -> str:
+    """'cuda' | 'mps' | 'cpu' for a device string like 'cuda:1'."""
+    return device.split(":", 1)[0]
 
 
 @dataclass
@@ -260,7 +276,7 @@ class EditLensDetector:
             # "error loading fbgemm.dll"), not ImportError. This is the tool
             # people call to diagnose that, so it must not raise.
             return f"unavailable ({type(exc).__name__})", "unknown"
-        device = self._requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        device = self._requested_device or pick_device(torch)
         return device, self._resolve_dtype_name(device)
 
     def _resolve_dtype_name(self, device: str) -> str:
@@ -269,11 +285,20 @@ class EditLensDetector:
         float16 is ~2.5x faster on long documents but identical on single
         paragraphs (14 ms either way), so the default favours running the weights
         unconverted. Set EDITLENS_DTYPE=float16 to trade 0.001 of score accuracy
-        for speed on long or batched work. float16 is GPU-only.
+        for speed on long or batched work. float16 needs a GPU (CUDA or Metal).
         """
         requested = (self._requested_dtype or "").lower()
+        if not requested:
+            return "float32"
         if requested in {"float16", "fp16", "16"}:
-            return "float16" if device.startswith("cuda") else "float32"
+            return "float16" if accelerator_of(device) in {"cuda", "mps"} else "float32"
+        if requested in {"float32", "fp32", "32"}:
+            return "float32"
+        # Unrecognised value: fall back rather than crash, but say so once.
+        print(
+            f"[editlens] warning: unknown EDITLENS_DTYPE={requested!r}; using float32",
+            file=sys.stderr,
+        )
         return "float32"
 
     def info(self) -> dict:
@@ -292,6 +317,9 @@ class EditLensDetector:
             "hf_token_present": bool(
                 os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
             ),
+            "platform": sys.platform,
+            "accelerator": accelerator_of(device),
+            "warmup_error": _warmup_error,
             "idle_unload_seconds": self.idle_unload_seconds,
             "idle_seconds": (
                 round(time.monotonic() - self._last_used, 1) if self._last_used else None
@@ -301,9 +329,27 @@ class EditLensDetector:
         }
 
     def _vram_mb(self) -> float | None:
-        if not self._loaded or self.torch is None or not self.device.startswith("cuda"):
+        if not self._loaded or self.torch is None:
             return None
-        return round(self.torch.cuda.memory_allocated() / 1024**2, 1)
+        accel = accelerator_of(self.device)
+        try:
+            if accel == "cuda":
+                return round(self.torch.cuda.memory_allocated() / 1024**2, 1)
+            if accel == "mps":
+                return round(self.torch.mps.current_allocated_memory() / 1024**2, 1)
+        except Exception:  # noqa: BLE001 - reporting must never break info()
+            return None
+        return None
+
+    def _empty_cache(self) -> None:
+        accel = accelerator_of(self.device)
+        try:
+            if accel == "cuda":
+                self.torch.cuda.empty_cache()
+            elif accel == "mps":
+                self.torch.mps.empty_cache()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
 
     @contextmanager
     def _active(self):
@@ -336,8 +382,8 @@ class EditLensDetector:
         self.tokenizer = None
         self._loaded = False
         gc.collect()
-        if self.torch is not None and self.device.startswith("cuda"):
-            self.torch.cuda.empty_cache()
+        if self.torch is not None:
+            self._empty_cache()
         return True
 
     def unload(self) -> bool:
@@ -397,15 +443,30 @@ class EditLensDetector:
             self._last_used = time.monotonic()
             self._start_watchdog()
 
+    @staticmethod
+    def torch_install_command() -> str:
+        """Platform-correct pip line. Mac wheels ship Metal support; the CUDA
+        index URL exists only for Windows and Linux."""
+        if sys.platform == "darwin":
+            return "pip install torch"
+        return "pip install torch --index-url https://download.pytorch.org/whl/cu126"
+
     def _setup_hint(self, exc: Exception) -> str:
         msg = str(exc)
         lines = [f"Could not load '{self.checkpoint}': {type(exc).__name__}: {msg}"]
         if "torch" in msg or "transformers" in msg or isinstance(exc, ModuleNotFoundError):
             lines.append(
-                "Install deps:  pip install torch --index-url "
-                "https://download.pytorch.org/whl/cu126  &&  pip install transformers safetensors"
+                f"Install deps:  {self.torch_install_command()}"
+                "  &&  pip install fastmcp transformers safetensors"
             )
-        if "401" in msg or "403" in msg or "gated" in msg.lower() or "restricted" in msg.lower():
+        if (
+            "401" in msg
+            or "403" in msg
+            or "gated" in msg.lower()
+            or "restricted" in msg.lower()
+            or "is not a valid model identifier" in msg
+            or "private repository" in msg.lower()
+        ):
             lines.append(
                 f"The repo is GATED. Accept the licence at https://huggingface.co/{self.checkpoint} "
                 "then set HF_TOKEN to a read token (hf auth login, or set the env var)."
@@ -456,7 +517,7 @@ class EditLensDetector:
         if self._requested_device:
             device = self._requested_device
         else:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = pick_device(torch)
 
         dtype_name = self._resolve_dtype_name(device)
         dtype = torch.float16 if dtype_name == "float16" else torch.float32

@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from editlens_mcp.detector import clean_text, clean_text_with_map, map_span  # noqa: E402
 
-PY = r"C:\Users\Aryan\AppData\Local\Programs\Python\Python313\python.exe"
+PY = sys.executable
 SCRIPT = str(Path(__file__).resolve().parent.parent / "run_server.py")
 
 # CRLF endings, double spaces after full stops, leading blank lines, trailing

@@ -5,8 +5,8 @@ and drive it. This is the path Antigravity uses.
 import asyncio, json, os, sys, tempfile
 from pathlib import Path
 
-PY = r"C:\Users\Aryan\AppData\Local\Programs\Python\Python313\python.exe"
-SCRIPT = r"C:\Users\Aryan\MCP-EditLens\run_server.py"
+PY = sys.executable
+SCRIPT = str(Path(__file__).resolve().parent.parent / "run_server.py")
 
 from fastmcp import Client
 from fastmcp.client.transports import StdioTransport

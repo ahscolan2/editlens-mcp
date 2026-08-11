@@ -1,9 +1,14 @@
 """Verify GPU memory is actually released on idle and on demand."""
 
-import sys, time, threading
-sys.path.insert(0, r"C:\Users\Aryan\MCP-EditLens")
-from editlens_mcp.detector import EditLensDetector
-import torch
+import sys
+import time
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from editlens_mcp.detector import EditLensDetector  # noqa: E402
+import torch  # noqa: E402
 
 TXT = "In today's rapidly evolving landscape, stakeholders leverage synergies to drive outcomes."
 
