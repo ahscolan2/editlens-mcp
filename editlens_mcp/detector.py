@@ -326,6 +326,7 @@ class EditLensDetector:
             "platform": sys.platform,
             "accelerator": accelerator_of(device),
             "device_fallback": self._device_fallback,
+            "cpu_backend": self._cpu_backend(),
             "warmup_error": _warmup_error,
             "idle_unload_seconds": self.idle_unload_seconds,
             "idle_seconds": (
@@ -334,6 +335,35 @@ class EditLensDetector:
             "vram_mb": self._vram_mb(),
             "auto_unloads": self._unloads,
         }
+
+    @staticmethod
+    def _cpu_backend() -> dict | None:
+        """Which BLAS the CPU path uses, and how many threads.
+
+        On Apple Silicon this should report Accelerate, which routes matrix
+        multiplies through the AMX units -- so CPU fallback is much faster than
+        the name suggests. If it reports something else, that is worth knowing
+        before blaming the model for slow inference.
+        """
+        try:
+            import torch  # noqa: PLC0415
+        except Exception:  # noqa: BLE001
+            return None
+        cfg = ""
+        try:
+            cfg = torch.__config__.show()
+        except Exception:  # noqa: BLE001
+            pass
+        blas = "unknown"
+        for name in ("Accelerate", "MKL", "OpenBLAS", "BLIS", "Eigen"):
+            if name.lower() in cfg.lower():
+                blas = name
+                break
+        try:
+            threads = torch.get_num_threads()
+        except Exception:  # noqa: BLE001
+            threads = None
+        return {"blas": blas, "threads": threads}
 
     def _vram_mb(self) -> float | None:
         if not self._loaded or self.torch is None:

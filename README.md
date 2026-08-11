@@ -75,6 +75,16 @@ its fallback logic is tested, but has not been run on real Apple Silicon. If Met
 misbehaves, `EDITLENS_DEVICE=cpu` always works — this model is small enough that CPU is
 usable. Please open an issue with `detector_info` output if you hit anything.
 
+CPU fallback on Apple Silicon is not the penalty it sounds like: PyTorch's macOS wheels link
+Apple's Accelerate framework, which routes matrix multiplies through the AMX units in the CPU
+cores. `detector_info.cpu_backend` reports which BLAS is actually in use — expect
+`Accelerate` on a Mac. What CPU mode does skip is the GPU and the Neural Engine.
+
+Reaching the Neural Engine would mean converting the model to Core ML, and squeezing more out
+of the GPU would mean an MLX port. Both are second inference paths to maintain and re-validate
+against these scores, so neither is here. For a 355M-parameter model, MPS is already fast
+enough that the added complexity would not pay for itself.
+
 ---
 
 ## Register with an MCP client
