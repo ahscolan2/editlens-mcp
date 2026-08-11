@@ -302,20 +302,26 @@ Default database location:
 python run_tests.py
 ```
 
-Nine suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
+Ten suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
 including error paths; SQLite concurrency and cross-process step allocation; span-offset
 correctness; branching and offset staleness; failure modes (simultaneous cold starts, failed
-commits, disk-full error reporting, accelerator fallback); precision, windowing, edge cases
-and determinism; GPU idle-unload and threading under load; and the real path — the server as
-a stdio subprocess, which is what MCP clients actually do.
+commits, disk-full error reporting, accelerator fallback); entry points and startup config;
+precision, windowing, edge cases and determinism; GPU idle-unload and threading under load;
+and the real path — the server as a stdio subprocess, which is what MCP clients actually do.
+
+`run_tests.py` forces `EDITLENS_DB` to a temp path before any suite runs, so testing can
+never migrate or write your real chain database.
 
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.
 
-The suite is mutation-tested: nine deliberate bugs were introduced one at a time — dropping
-the score normalisation, skipping the last window, restoring double-counted overlaps,
-inverting `best_step`, storing empty drafts, ignoring missing segments, shifting the offset
-map, dropping the UNIQUE index, forcing float16 — and all nine were caught.
+The suite is mutation-tested: deliberate bugs are introduced one at a time and the suite must
+fail. Over 30 have been tried — dropping the score normalisation, skipping the last window,
+restoring double-counted overlaps, inverting `best_step`, storing empty drafts, ignoring
+missing segments, truncating CRLF spans, dropping the UNIQUE index, forcing float16, removing
+the WAL retry, scoring by argmax instead of expectation, deleting the `_guard` decorator —
+and every one is now caught. Several were not, until the tests were strengthened to catch
+them; a test that cannot fail is worse than no test.
 
 On a machine without a GPU (or with `EDITLENS_DEVICE=cpu`), the GPU-memory suite skips itself
 and the float16 comparison is skipped; everything else runs.
