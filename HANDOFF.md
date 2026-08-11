@@ -97,6 +97,62 @@ The Mac agent used `distilroberta-base`, not the real checkpoint. Anything about
 
 ---
 
+## Environment and access (all of this already works — don't re-do it)
+
+- **Hugging Face:** logged in as `lemonsad`; access to the gated checkpoint is already
+  granted and the ~1.4 GB weights are cached. `hf auth whoami` confirms. Do **not** ask the
+  owner for a token — and never handle one yourself.
+- **To run the model path without gated access at all** (e.g. on a fresh machine, or in an
+  agent that shouldn't touch credentials): `EDITLENS_CHECKPOINT=distilroberta-base`. This
+  runs 10 of 11 suites for real. Only the actual checkpoint's *scores* need the gate, so
+  treat any score-dependent finding from such a run as unverified.
+- **GitHub:** `gh` authenticated as `ahscolan2`. Repo is **private**.
+- **Registered as an MCP server in three places**, all currently pointing at
+  `run_server.py`. The Antigravity app and the `agy` CLI read *separate* files — a server
+  added to one is invisible to the other:
+  - `~/.claude.json` (Claude Code)
+  - `~/.gemini/antigravity/mcp_config.json` (Antigravity app)
+  - `~/.gemini/config/mcp_config.json` (`agy` CLI)
+- **Live chain database:** `%LOCALAPPDATA%\editlens-mcp\chains.db`, ~28 KB. It predates the
+  `parent_step` column and has never been migrated. Migration is now race-safe, so it will
+  convert cleanly on first real use. **Never point tests at it.**
+- **`agy` (Google's Antigravity CLI) is installed** at
+  `C:\Users\Aryan\AppData\Local\agy\bin\agy.exe` and the owner prefers it for bulk agent work
+  because it doesn't consume Claude usage. Print mode:
+  `agy -p "<prompt>" --add-dir <path> --dangerously-skip-permissions --print-timeout 30m`.
+  It writes nothing until it finishes, so an empty output file is not a stall. Launch it via
+  `Start-Process` with redirected stdout/stderr.
+- **Session limits are a real constraint.** Two agents have already died mid-task on them.
+  Tell every agent to report partial results rather than lose them, and to do the cheap
+  certain task before the open-ended one.
+
+## Already fixed — paste this into agent prompts so they don't re-report it
+
+> KNOWN AND DELIBERATE — do not report these: torch is imported on the main thread at
+> startup (worker-thread imports hang on Windows); requests are serialised because
+> HuggingFace's Rust tokenizer is not thread-safe; float32 is the intentional default;
+> macOS/Metal is implemented but untested on real Apple Silicon; EditLens genuinely
+> false-positives on short informal text (a casual human paragraph can score 0.99 — that is
+> the model, not a bug, though how the server *guides* an agent in that situation is in
+> scope); pydantic rejects wrong-typed arguments before the tool body runs, so those surface
+> as ToolError rather than a dict.
+
+Also already found and fixed, so don't spend a round rediscovering them: the CRLF span
+truncation (offsets ending at the `\r`), the WAL and `ALTER TABLE` startup races, the
+shared-SQLite-connection corruption, the `_guard` decorator that makes every tool return a
+dict, the window-overlap double counting, `chain_assemble`'s completeness gate, the
+empty-env-var import crashes, and `run_tests.py` writing the operator's real database.
+
+## Running things
+
+```bash
+python run_tests.py                  # all 11 suites, several minutes
+python tests/test_tools.py           # one suite, fast — good smoke check
+python tests/test_client.py          # the stdio-subprocess suite (see finding A1)
+```
+
+Always set `EDITLENS_DB` to a temp path in anything you write.
+
 ## How this project has been worked, and why
 
 Seven rounds of review agents. Every round found something real. The two highest-yield
