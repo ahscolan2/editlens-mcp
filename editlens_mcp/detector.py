@@ -281,6 +281,10 @@ class EditLensDetector:
         self._unloads = 0
         self._device_fallback: str | None = None
         self._warned_dtype = False
+        # Where the last successful load actually landed, so info() can report
+        # reality rather than re-predicting after an unload.
+        self._last_device: str | None = None
+        self._last_dtype: str | None = None
 
         self.model = None
         self.tokenizer = None
@@ -301,6 +305,12 @@ class EditLensDetector:
         model is loaded so `detector_info` never claims CPU on a CUDA machine."""
         if self._loaded:
             return self.device, self.dtype
+        # Prefer evidence over prediction. The model unloads after 5 minutes
+        # idle, so on a machine that fell back to CPU the unloaded state is
+        # where detector_info spends most of its life -- and recomputing from
+        # the request there reports a device already proven unusable.
+        if self._last_device is not None:
+            return self._last_device, self._last_dtype or "unknown"
         try:
             import torch  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
@@ -554,6 +564,10 @@ class EditLensDetector:
             probe = tokenizer("ok", return_tensors="pt").to(device)
             with torch.no_grad():
                 placed(**probe)
+            # Clear any earlier fallback: a transient failure (a GPU busy with
+            # another process) must not leave info() reporting a fallback that
+            # a later reload has already recovered from.
+            self._device_fallback = None
             return placed, device, dtype_name
         except Exception as exc:  # noqa: BLE001
             if accelerator_of(device) == "cpu":
@@ -627,6 +641,7 @@ class EditLensDetector:
         # downgraded to float32, and reporting the request rather than the
         # reality is exactly the misreport this field exists to prevent.
         self.dtype = dtype_name
+        self._last_device, self._last_dtype = device, dtype_name
         self.n_buckets = int(model.config.num_labels)
         self.bucket_names = BUCKET_NAMES.get(
             self.n_buckets, [f"bucket_{i}" for i in range(self.n_buckets)]

@@ -90,24 +90,60 @@ class ChainStore:
             str(self.path), check_same_thread=False, timeout=timeout, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
-        # busy_timeout FIRST: it governs every later statement. Setting it after
-        # journal_mode leaves the riskiest statement unprotected.
-        self._conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
-        self.journal_mode = self._set_wal(timeout)
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(SCHEMA)
-        # Databases written before branching support lack this column.
-        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(steps)")}
-        if "parent_step" not in cols:
-            self._conn.execute("ALTER TABLE steps ADD COLUMN parent_step INTEGER")
         self.duplicate_steps_present = False
+        # Close the connection if setup fails part-way. Leaking it holds an OS
+        # handle on the database plus its -wal/-shm sidecars, so the file cannot
+        # even be deleted afterwards.
         try:
-            self._conn.execute(UNIQUE_STEP_INDEX)
-        except sqlite3.IntegrityError:
-            # Legacy database written before the constraint existed. Leave the
-            # data alone -- callers are told via this flag rather than silently
-            # losing rows to a dedupe we never asked permission for.
-            self.duplicate_steps_present = True
+            # busy_timeout FIRST: it governs every later statement. Setting it
+            # after journal_mode leaves the riskiest statement unprotected.
+            self._conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
+            self.journal_mode = self._set_wal(timeout)
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.executescript(SCHEMA)
+            self._migrate(timeout)
+            try:
+                self._conn.execute(UNIQUE_STEP_INDEX)
+            except sqlite3.IntegrityError:
+                # Legacy database written before the constraint existed. Leave
+                # the data alone -- callers are told via this flag rather than
+                # silently losing rows to a dedupe we never asked permission for.
+                self.duplicate_steps_present = True
+        except BaseException:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+    def _migrate(self, timeout: float) -> None:
+        """Add columns missing from databases written by older versions.
+
+        Checking `table_info` and then running ALTER is a check-then-act race:
+        two processes opening a pre-branching database both see the column
+        missing, both ALTER, and the loser dies with "duplicate column name" --
+        at module import, so the client just sees a dead process. Treat losing
+        the race as success, which it is: the column exists either way.
+        """
+        deadline = time.monotonic() + max(2.0, timeout)
+        delay = 0.02
+        while True:
+            try:
+                cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(steps)")}
+                if "parent_step" in cols:
+                    return
+                self._conn.execute("ALTER TABLE steps ADD COLUMN parent_step INTEGER")
+                return
+            except sqlite3.OperationalError as exc:
+                msg = str(exc).lower()
+                if "duplicate column" in msg:
+                    return  # another process migrated it first
+                if "locked" not in msg and "busy" not in msg:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.25)
 
     def _set_wal(self, timeout: float) -> str:
         """Switch to WAL, retrying by hand.
