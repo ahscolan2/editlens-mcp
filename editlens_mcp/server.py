@@ -21,7 +21,9 @@ from .detector import (
     DetectorUnavailable,
     EditLensDetector,
     clean_text,
+    clean_text_with_map,
     count_words,
+    map_span,
     split_units_adaptive,
     warmup_imports,
 )
@@ -47,6 +49,8 @@ detector = EditLensDetector(
 store = ChainStore(os.environ.get("EDITLENS_DB", DEFAULT_DB))
 
 MAX_SPAN_REPORT = 5
+# Below this the model's score is indicative rather than precise.
+RELIABLE_WORDS = 25
 
 
 def _fail(exc: Exception) -> dict:
@@ -75,23 +79,29 @@ def _guard(fn):
 
 
 def _worst_spans(text: str, granularity: str = "sentence", top: int = MAX_SPAN_REPORT) -> list[dict]:
-    """Score sentence-groups and return the highest-scoring ones."""
-    source = clean_text(text)
+    """Score sentence-groups and return the highest-scoring ones.
+
+    `start`/`end` index the caller's ORIGINAL text, not the normalised copy the
+    model sees -- offsets you cannot splice against are worse than no offsets.
+    """
+    source, imap = clean_text_with_map(text)
     units, _ = split_units_adaptive(source, granularity=granularity)
     if len(units) < 2:
         return []
     verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
-    rows = [
-        {
-            "start": a,
-            "end": b,
-            "score": round(v.score, 4),
-            "label": v.label,
-            "words": v.word_count,
-            "text": source[a:b],
-        }
-        for (a, b), v in zip(units, verdicts)
-    ]
+    rows = []
+    for (a, b), v in zip(units, verdicts):
+        o0, o1 = map_span(imap, a, b, len(text))
+        rows.append(
+            {
+                "start": o0,
+                "end": o1,
+                "score": round(v.score, 4),
+                "label": v.label,
+                "words": v.word_count,
+                "text": source[a:b],
+            }
+        )
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows[:top]
 
@@ -105,8 +115,11 @@ def detector_info() -> dict:
     """Report detector status: checkpoint, device, dtype, bucket labels, whether the
     model is loaded yet, and whether an HF token is visible. Call this first if
     anything errors."""
-    info = detector.info()
+    # "ok" on the success path too: _guard supplies it on failure, and a client
+    # branching on result["ok"] should not KeyError when nothing went wrong.
+    info = {"ok": True, **detector.info()}
     info["db_path"] = str(store.path)
+    info["duplicate_steps_present"] = store.duplicate_steps_present
     return info
 
 
@@ -204,9 +217,13 @@ def detect_spans(
     would leave the whole text as one unit, the threshold is relaxed
     automatically and `min_words_used` reports what it settled on. Treat units
     under ~25 words as indicative rather than precise.
+
+    `start`/`end` are offsets into the text YOU passed in, so you can splice a
+    rewrite straight back. `text` is the normalised form the model scored
+    (whitespace collapsed), which may differ from that slice.
     """
     try:
-        source = clean_text(text)
+        source, imap = clean_text_with_map(text)
         units, used = split_units_adaptive(
             source, granularity=granularity, min_words=min_words
         )
@@ -217,28 +234,41 @@ def detect_spans(
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
 
-    rows = [
-        {
-            "unit": i,
-            "start": a,
-            "end": b,
-            "score": round(v.score, 4),
-            "label": v.label,
-            "words": v.word_count,
-            "text": source[a:b],
-        }
-        for i, ((a, b), v) in enumerate(zip(units, verdicts))
-    ]
+    rows = []
+    for i, ((a, b), v) in enumerate(zip(units, verdicts)):
+        o0, o1 = map_span(imap, a, b, len(text))
+        rows.append(
+            {
+                "unit": i,
+                "start": o0,
+                "end": o1,
+                "score": round(v.score, 4),
+                "label": v.label,
+                "words": v.word_count,
+                # The model is a document-level classifier; below ~25 words its
+                # score is indicative at best. Say so per unit rather than
+                # letting a 1-word paragraph look as solid as a paragraph.
+                "reliable": v.word_count >= RELIABLE_WORDS,
+                "text": source[a:b],
+            }
+        )
     ranked = sorted(rows, key=lambda r: r["score"], reverse=True)[:top]
-    return {
+    out = {
         "ok": True,
         "document_score": round(overall.score, 4),
         "document_label": overall.label,
         "unit_count": len(rows),
-        "min_words_used": used,
-        "granularity_relaxed": used < min_words,
         "worst_units": ranked,
     }
+    if granularity == "sentence":
+        out["min_words_used"] = used
+        out["granularity_relaxed"] = used < min_words
+    else:
+        # Paragraphs are authored boundaries -- min_words was never applied.
+        out["min_words_used"] = None
+        out["granularity_relaxed"] = False
+    out["unreliable_units"] = sum(1 for r in rows if not r["reliable"])
+    return out
 
 
 # ------------------------------------------------------------------------ chains
@@ -289,12 +319,17 @@ def chain_submit(
     try:
         chain = store.get(chain_id)
         segs = json.loads(chain["segments"])
-        if segment not in segs:
-            segs = store.add_segment(chain_id, segment)
+        is_new_segment = segment not in segs
 
         prev = store.latest_step(chain_id, segment)
         prev_best = store.best_step(chain_id, segment)
+        # Score BEFORE registering a new segment. Registering first means a
+        # failed submit -- empty text, a typo'd segment name, a CUDA OOM -- still
+        # commits the segment, after which chain_assemble reports the chain
+        # permanently incomplete with no way to remove it again.
         verdict, _ = detector.detect(text)
+        if is_new_segment:
+            segs = store.add_segment(chain_id, segment)
         step_no = store.add_step(
             chain_id,
             segment,

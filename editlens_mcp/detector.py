@@ -19,8 +19,12 @@ from typing import Sequence
 CHECKPOINT = os.environ.get("EDITLENS_CHECKPOINT", "pangram/editlens_roberta-large")
 BASE_MODEL = os.environ.get("EDITLENS_BASE_MODEL", "FacebookAI/roberta-large")
 MAX_LENGTH = 512
-# Room for <s> and </s>.
-MAX_CONTENT_TOKENS = MAX_LENGTH - 2
+# Room for <s> and </s>, plus slack. Windows are chosen on the full document's
+# token stream but handed to the model as CHARACTER slices, which get
+# re-tokenised; a slice loses the leading-space context of its first token, so it
+# can come back longer than it went in (measured: 510 -> 514) and then be
+# silently truncated. The extra margin keeps re-tokenisation inside the limit.
+MAX_CONTENT_TOKENS = MAX_LENGTH - 22
 
 BUCKET_NAMES: dict[int, list[str]] = {
     2: ["Human-written", "AI-generated"],
@@ -106,6 +110,92 @@ def clean_text(text: str) -> str:
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     text = _BLANKS.sub("\n\n", text)
     return text.strip()
+
+
+def clean_text_with_map(text: str) -> tuple[str, list[int]]:
+    """clean_text(), plus a map from each cleaned char back to the original.
+
+    Callers get char offsets for the spans we flag. Those offsets used to index
+    the cleaned string, which the caller never receives -- so on any text with
+    CRLF line endings or double spaces they pointed at the wrong characters, and
+    a client splicing a rewrite at them would corrupt its own document. The map
+    lets offsets be reported in the caller's own coordinates.
+
+    `map[i]` is the index in `text` of cleaned character `i`.
+    """
+    # 1. newline normalisation
+    c1: list[str] = []
+    i1: list[int] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "\r":
+            c1.append("\n")
+            i1.append(i)
+            i += 2 if (i + 1 < n and text[i + 1] == "\n") else 1
+            continue
+        c1.append(text[i])
+        i1.append(i)
+        i += 1
+    s1 = "".join(c1)
+
+    # 2. collapse runs of horizontal whitespace to one space
+    c2: list[str] = []
+    i2: list[int] = []
+    pos = 0
+    for m in _WS_RUN.finditer(s1):
+        c2.extend(s1[pos : m.start()])
+        i2.extend(i1[pos : m.start()])
+        c2.append(" ")
+        i2.append(i1[m.start()])
+        pos = m.end()
+    c2.extend(s1[pos:])
+    i2.extend(i1[pos:])
+
+    # 3. rstrip each line
+    c3: list[str] = []
+    i3: list[int] = []
+    line_start = 0
+    for k in range(len(c2) + 1):
+        if k == len(c2) or c2[k] == "\n":
+            keep = len("".join(c2[line_start:k]).rstrip())
+            c3.extend(c2[line_start : line_start + keep])
+            i3.extend(i2[line_start : line_start + keep])
+            if k < len(c2):
+                c3.append("\n")
+                i3.append(i2[k])
+            line_start = k + 1
+    s3 = "".join(c3)
+
+    # 4. collapse 3+ blank lines to one blank line
+    c4: list[str] = []
+    i4: list[int] = []
+    pos = 0
+    for m in _BLANKS.finditer(s3):
+        c4.extend(s3[pos : m.start()])
+        i4.extend(i3[pos : m.start()])
+        c4.extend("\n\n")
+        i4.extend((i3[m.start()], i3[m.start() + 1]))
+        pos = m.end()
+    c4.extend(s3[pos:])
+    i4.extend(i3[pos:])
+    s4 = "".join(c4)
+
+    # 5. strip
+    a, b = 0, len(s4)
+    while a < b and s4[a].isspace():
+        a += 1
+    while b > a and s4[b - 1].isspace():
+        b -= 1
+    return s4[a:b], i4[a:b]
+
+
+def map_span(imap: list[int], start: int, end: int, original_len: int) -> tuple[int, int]:
+    """Translate a [start, end) span over cleaned text into original coordinates."""
+    if not imap or start >= len(imap):
+        return 0, 0
+    o_start = imap[start]
+    o_end = (imap[end - 1] + 1) if 0 < end <= len(imap) else original_len
+    return o_start, min(o_end, original_len)
 
 
 def count_words(text: str) -> int:
@@ -332,23 +422,36 @@ class EditLensDetector:
 
         try:
             tokenizer = AutoTokenizer.from_pretrained(self.checkpoint, **kwargs)
-        except Exception:  # tokenizer files may live only on the base repo
-            tokenizer = AutoTokenizer.from_pretrained(self.base_model, **kwargs)
+        except Exception as primary:  # tokenizer files may live only on the base repo
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(self.base_model, **kwargs)
+            except Exception:
+                raise primary from None
 
         try:
             model = AutoModelForSequenceClassification.from_pretrained(self.checkpoint, **kwargs)
-        except Exception:
-            # Fall back to the PEFT-adapter layout if the repo ships an adapter only.
-            from peft import PeftConfig, PeftModel  # noqa: PLC0415
+        except Exception as primary:
+            # Fall back to the PEFT-adapter layout if the repo ships an adapter
+            # only. If that fallback cannot even start, re-raise the ORIGINAL
+            # error: peft is not installed by default, so letting its
+            # ModuleNotFoundError win means every real failure (gated repo, bad
+            # token, no network) is reported as "No module named 'peft'" and the
+            # gated-repo guidance below becomes unreachable.
+            try:
+                from peft import PeftConfig, PeftModel  # noqa: PLC0415
 
-            cfg = PeftConfig.from_pretrained(self.checkpoint, **kwargs)
-            n_labels = getattr(cfg, "num_labels", None) or 4
-            base = AutoModelForSequenceClassification.from_pretrained(
-                cfg.base_model_name_or_path or self.base_model,
-                num_labels=n_labels,
-                **kwargs,
-            )
-            model = PeftModel.from_pretrained(base, self.checkpoint, **kwargs).merge_and_unload()
+                cfg = PeftConfig.from_pretrained(self.checkpoint, **kwargs)
+                n_labels = getattr(cfg, "num_labels", None) or 4
+                base = AutoModelForSequenceClassification.from_pretrained(
+                    cfg.base_model_name_or_path or self.base_model,
+                    num_labels=n_labels,
+                    **kwargs,
+                )
+                model = PeftModel.from_pretrained(
+                    base, self.checkpoint, **kwargs
+                ).merge_and_unload()
+            except Exception:
+                raise primary from None
 
         if self._requested_device:
             device = self._requested_device
@@ -422,6 +525,24 @@ class EditLensDetector:
             pos += step
         return spans
 
+    @staticmethod
+    def _owned_ranges(
+        spans: list[tuple[int, int, str]], text_len: int
+    ) -> list[tuple[int, int]]:
+        """Partition the document among overlapping windows, splitting each
+        overlap at its midpoint so the ranges tile without double-counting."""
+        if len(spans) == 1:
+            return [(spans[0][0], spans[0][1])]
+        owned: list[tuple[int, int]] = []
+        for i, (c0, c1, _) in enumerate(spans):
+            start = c0 if i == 0 else max(c0, (spans[i - 1][1] + c0) // 2)
+            end = c1 if i == len(spans) - 1 else min(c1, (c1 + spans[i + 1][0]) // 2)
+            owned.append((start, max(start, end)))
+        # Guarantee full coverage even if a window is fully contained in another.
+        owned[0] = (spans[0][0], owned[0][1])
+        owned[-1] = (owned[-1][0], max(owned[-1][1], spans[-1][1], text_len))
+        return owned
+
     def detect(self, text: str, normalise: bool = True) -> tuple[Verdict, list[dict]]:
         """Score a document. Long inputs are windowed and length-weighted."""
         source = clean_text(text) if normalise else text
@@ -432,12 +553,20 @@ class EditLensDetector:
             spans = self.windows(source)
             scored = self._score_batch([s[2] for s in spans])
 
+        # Weight each window by the text it exclusively OWNS, not by its full
+        # length. Windows overlap by design (the model needs context either side
+        # of a split), but weighting by full length counts the overlap twice --
+        # measured up to +0.03 score inflation on documents just over one window,
+        # i.e. ordinary essay length. Overlaps are split at their midpoint so
+        # every character is counted exactly once.
+        owned = self._owned_ranges(spans, len(source))
+
         details: list[dict] = []
         total_w = 0.0
         acc_score = 0.0
         acc_probs = [0.0] * self.n_buckets
-        for (c0, c1, chunk), (score, probs) in zip(spans, scored):
-            w = float(count_words(chunk)) or 1.0
+        for (c0, c1, chunk), (o0, o1), (score, probs) in zip(spans, owned, scored):
+            w = float(count_words(source[o0:o1])) or 1.0
             total_w += w
             acc_score += score * w
             acc_probs = [a + p * w for a, p in zip(acc_probs, probs)]
@@ -445,6 +574,8 @@ class EditLensDetector:
                 {
                     "start": c0,
                     "end": c1,
+                    "owned_start": o0,
+                    "owned_end": o1,
                     "words": int(w),
                     "score": round(score, 4),
                     "label": self.bucket_names[int(round(score * (self.n_buckets - 1)))],
@@ -543,6 +674,10 @@ def split_units(text: str, granularity: str = "sentence", min_words: int = 25) -
             start = text.index(block, pos) if block else pos
             pieces.append((start, start + len(block)))
             pos = start + len(block)
+        # Paragraphs are returned as authored -- merging them would defeat the
+        # point of asking for paragraph granularity. `min_words` therefore does
+        # not apply here, and split_units_adaptive reports that honestly rather
+        # than claiming a threshold it never enforced.
         return [p for p in pieces if text[p[0] : p[1]].strip()]
 
     raw = _sentence_spans(text)
@@ -575,8 +710,12 @@ def split_units_adaptive(
     and the threshold actually used, since smaller units are noisier and the
     caller should be able to say so.
     """
+    if granularity != "sentence":
+        # Paragraph units are authored boundaries; no threshold was applied.
+        return split_units(text, granularity, min_words), 0
+
     units = split_units(text, granularity, min_words)
-    if len(units) >= min_units or granularity != "sentence":
+    if len(units) >= min_units:
         return units, min_words
     for relaxed in (15, 8, 1):
         if relaxed >= min_words:
