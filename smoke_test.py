@@ -7,11 +7,23 @@ stubbed model, then optionally runs the real detector if it can be loaded.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# BEFORE importing the server: `editlens_mcp.server` opens a ChainStore at
+# default_db_path() the moment it is imported, and test_tool_registration imports
+# it. Without this the smoke test -- which run_tests.py runs first, and which the
+# README gives as the way to verify an install -- creates, WAL-converts and
+# ALTER-TABLEs the operator's live chain database at
+# %LOCALAPPDATA%/editlens-mcp/chains.db. Tests do not touch production data.
+# (setdefault is not enough: default_db_path() treats an EMPTY EDITLENS_DB as
+# unset, so an empty one would still land on the production path.)
+if not (os.environ.get("EDITLENS_DB") or "").strip():
+    os.environ["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "smoke.db")
 
 from editlens_mcp.chains import ChainStore  # noqa: E402
 from editlens_mcp.detector import clean_text, count_words, split_units  # noqa: E402

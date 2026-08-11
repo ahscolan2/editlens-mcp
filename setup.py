@@ -84,7 +84,13 @@ def main() -> int:
     try:
         import torch  # noqa: F401
         print("\ntorch already installed; skipping install")
-    except ImportError:
+    except Exception as exc:  # noqa: BLE001
+        # NOT `except ImportError`. The failure this script exists to repair --
+        # a torch that is installed but unloadable -- raises OSError on Windows
+        # ("[WinError 126] ... error loading fbgemm.dll"), which escaped as a raw
+        # traceback instead of triggering the reinstall. detector.py already
+        # catches broadly for exactly this reason.
+        print(f"\ntorch not usable ({type(exc).__name__}: {exc}); (re)installing")
         if run(torch_install_cmd()) != 0:
             print("\nPyTorch install failed. See https://pytorch.org/get-started/locally/")
             return 1
