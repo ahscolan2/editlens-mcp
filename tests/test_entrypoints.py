@@ -158,6 +158,54 @@ def test_smoke_test_never_touches_the_default_database():
     print("  smoke_test.py leaves the default DB location untouched")
 
 
+def test_run_tests_forces_a_temp_database():
+    """The floor in run_tests.py, tested directly.
+
+    Every suite currently sets its own EDITLENS_DB, so deleting the floor breaks
+    nothing today -- which is exactly why it needs its own test. It is what stops
+    a suite added tomorrow from falling through to default_db_path() and running
+    schema migrations against the operator's live chain database.
+    """
+    from editlens_mcp.chains import default_db_path
+
+    fake_home = Path(tempfile.mkdtemp())
+    probe = (
+        "import sys, os; sys.path.insert(0, r'%s')\n"
+        "import run_tests\n"
+        "print('DB=' + os.environ.get('EDITLENS_DB', '<unset>'))\n"
+    ) % ROOT
+
+    def ask(value):
+        env = dict(os.environ)
+        env.pop("EDITLENS_DB", None)
+        for var in ("LOCALAPPDATA", "XDG_DATA_HOME", "USERPROFILE", "HOME"):
+            env[var] = str(fake_home)
+        if value is not None:
+            env["EDITLENS_DB"] = value
+        p = subprocess.run([PY, "-c", probe], env=env, capture_output=True,
+                           text=True, cwd=str(ROOT), timeout=300)
+        assert p.returncode == 0, p.stdout[-400:] + p.stderr[-400:]
+        line = [ln for ln in p.stdout.splitlines() if ln.startswith("DB=")][-1]
+        return line[3:], env
+
+    default = str(default_db_path())
+    for value in (None, "", "   "):
+        got, env = ask(value)
+        assert got not in ("", "<unset>"), f"EDITLENS_DB={value!r} left it {got!r}"
+        assert Path(got).name == "run_tests.db", got
+        assert got != default, (
+            f"EDITLENS_DB={value!r} fell through to the operator's database: {got}")
+        # And nothing under the fake home was created merely by importing.
+        assert not list(fake_home.rglob("chains.db*")), list(fake_home.rglob("chains.db*"))
+
+    # An explicit path the operator set must be left exactly as it is.
+    mine = str(Path(tempfile.mkdtemp()) / "mine.db")
+    got, _ = ask(mine)
+    assert got == mine, f"run_tests.py overrode an explicit EDITLENS_DB: {got}"
+    print("  run_tests.py floors EDITLENS_DB (empty counts as unset) and keeps an "
+          "explicit one")
+
+
 def test_setup_survives_a_torch_that_raises_oserror():
     """setup.py repairs broken installs, so it must not die on one.
 
@@ -251,6 +299,7 @@ if __name__ == "__main__":
     test_empty_transport_falls_back_to_stdio()
     test_batch_size_below_one_is_clamped()
     test_smoke_test_never_touches_the_default_database()
+    test_run_tests_forces_a_temp_database()
     test_setup_survives_a_torch_that_raises_oserror()
     test_submit_losing_a_race_with_delete_reports_the_chain()
     print("ENTRYPOINT TESTS PASSED")

@@ -19,6 +19,7 @@ from editlens_mcp.detector import (  # noqa: E402
     clean_text_with_map,
     map_span,
     split_units,
+    split_units_adaptive,
 )
 
 PY = sys.executable
@@ -165,6 +166,99 @@ def test_crlf_span_keeps_both_characters():
     print(f"  CRLF span = {sliced!r}; splice reconstructs cleanly")
 
 
+def test_paragraph_units_are_the_paragraphs_exactly():
+    """Paragraph spans must be the authored blocks -- no separator, nothing clipped.
+
+    Only the unit COUNT was ever asserted, so a paragraph span that swallowed the
+    blank line before it, or lost its final character, passed every suite. Both
+    corrupt a splice: the first re-inserts the separator, the second eats a full
+    stop.
+    """
+    cases = [
+        # (text, expected unit texts)
+        ("First para line one.\nStill first para.\n\nSecond para here.\n\nThird ends.",
+         ["First para line one.\nStill first para.", "Second para here.", "Third ends."]),
+        ("alpha\n\n\n\nbeta", ["alpha", "beta"]),
+        # Blank blocks must be dropped, not handed to the model as empty units
+        # (detect_many raises "item N is empty" on those).
+        ("a\n\nb\n\n", ["a", "b"]),
+        ("\n\n\na\n\nb", ["a", "b"]),
+        # Separators made of whitespace-only lines.
+        ("one\n   \ntwo", ["one", "two"]),
+        ("single paragraph only", ["single paragraph only"]),
+    ]
+    for text, expected in cases:
+        units = split_units(text, "paragraph")
+        got = [text[a:b] for a, b in units]
+        assert got == expected, f"{text!r} -> {got!r}, expected {expected!r}"
+        for a, b in units:
+            assert text[a:b] == text[a:b].strip(), (
+                f"unit {(a, b)} of {text!r} carries separator whitespace: {text[a:b]!r}")
+        for (_, a1), (b0, _) in zip(units, units[1:]):
+            assert a1 <= b0, f"paragraph units overlap in {text!r}: {units}"
+    print(f"  {len(cases)} paragraph inputs split on authored boundaries exactly")
+
+
+def test_paragraph_offsets_index_the_original():
+    """Paragraph granularity gets the same offset guarantee as sentences."""
+    raw = ("\r\n\r\n  First para line one.\r\nStill  first para.   \r\n"
+           "\r\n\r\n\r\nSecond  para here.  \r\n\r\nThird para ends.\r\n\r\n")
+    cleaned, ranges = clean_text_with_map(raw)
+    units = split_units(cleaned, "paragraph")
+    assert len(units) == 3, [cleaned[a:b] for a, b in units]
+    mapped = [map_span(ranges, a, b, len(raw)) for a, b in units]
+    for (a, b), (o0, o1) in zip(units, mapped):
+        assert raw[o0:o1].split() == cleaned[a:b].split(), (
+            f"paragraph {(a, b)} -> {(o0, o1)}: {raw[o0:o1]!r} vs {cleaned[a:b]!r}")
+        # A mapped paragraph must not start or end inside the separator.
+        assert raw[o0:o1].strip() == raw[o0:o1].strip("\r\n "), raw[o0:o1]
+    for (_, x1), (y0, _) in zip(mapped, mapped[1:]):
+        assert x1 <= y0, f"mapped paragraphs overlap: {mapped}"
+    assert mapped[-1][1] <= len(raw)
+    print(f"  3 paragraphs map to {mapped} in the original")
+
+
+def test_paragraph_granularity_applies_no_threshold():
+    """split_units_adaptive must report 0 for paragraphs, because min_words was
+    never applied -- that 0 is what makes the tool answer `min_words_used: null`
+    instead of naming a threshold it never enforced."""
+    text = "One. Two. Three.\n\nFour. Five. Six."
+    units, used = split_units_adaptive(text, granularity="paragraph")
+    assert [text[a:b] for a, b in units] == ["One. Two. Three.", "Four. Five. Six."]
+    assert used == 0, f"paragraphs reported a threshold of {used}"
+    # Even with a threshold that would swallow both, paragraphs stay paragraphs.
+    units2, used2 = split_units_adaptive(text, granularity="paragraph", min_words=200)
+    assert units2 == units and used2 == 0, (units2, used2)
+    # A single paragraph must not be relaxed into sentences either.
+    solo, solo_used = split_units_adaptive("One. Two. Three.", granularity="paragraph")
+    assert len(solo) == 1 and solo_used == 0, (solo, solo_used)
+    print("  paragraph granularity reports no threshold and never sentence-splits")
+
+
+def test_map_span_refuses_impossible_spans():
+    """An empty, inverted or out-of-range span must map to nothing, and no span
+    may end past the text the caller actually holds."""
+    cleaned, ranges = clean_text_with_map("alpha  beta\r\ngamma delta")
+    n = len(cleaned)
+    original = len("alpha  beta\r\ngamma delta")
+
+    assert map_span(ranges, 5, 5, original) == (0, 0), "empty span must map to nothing"
+    assert map_span(ranges, 7, 2, original) == (0, 0), "inverted span must map to nothing"
+    assert map_span(ranges, n, n + 4, original) == (0, 0), "span past the map"
+    assert map_span([], 0, 3, original) == (0, 0)
+
+    # The clamp exists for the caller who hands us a shorter string than the one
+    # the map was built from; offsets past its end are unsliceable.
+    o0, o1 = map_span(ranges, 0, n, 4)
+    assert o1 <= 4, f"offset {o1} points past the caller's {4}-char text"
+    assert o0 <= o1
+
+    # And the ordinary case is untouched.
+    o0, o1 = map_span(ranges, 0, n, original)
+    assert (o0, o1) == (0, original), (o0, o1)
+    print("  map_span rejects empty/inverted/out-of-range spans and clamps the end")
+
+
 def test_clean_text_offsets_unchanged_when_text_is_already_clean():
     tidy = "One sentence here. Another sentence follows. A third one closes it."
     cleaned, imap = clean_text_with_map(tidy)
@@ -180,6 +274,10 @@ if __name__ == "__main__":
     test_spans_tile_the_original_exactly()
     test_ranges_are_contiguous()
     test_crlf_span_keeps_both_characters()
+    test_paragraph_units_are_the_paragraphs_exactly()
+    test_paragraph_offsets_index_the_original()
+    test_paragraph_granularity_applies_no_threshold()
+    test_map_span_refuses_impossible_spans()
     test_clean_text_offsets_unchanged_when_text_is_already_clean()
     test_server_offsets_index_original()
     print("OFFSET TESTS PASSED")
