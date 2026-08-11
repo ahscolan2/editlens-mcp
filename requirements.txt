@@ -1,0 +1,8 @@
+fastmcp>=3.0
+transformers>=4.44
+safetensors>=0.4
+huggingface_hub>=0.24
+# torch is installed separately so you get the right CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# peft is only needed if the checkpoint ever ships as an adapter-only repo:
+# peft>=0.11
