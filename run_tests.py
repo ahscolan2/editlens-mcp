@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 SUITES = [
     ("smoke", [sys.executable, "-u", str(ROOT / "smoke_test.py"), "--real"]),
     ("tools", [sys.executable, "-u", str(ROOT / "tests" / "test_tools.py")]),
+    ("concurrency", [sys.executable, "-u", str(ROOT / "tests" / "test_concurrency.py")]),
     ("detector", [sys.executable, "-u", str(ROOT / "tests" / "test_detector.py")]),
     ("gpu_memory", [sys.executable, "-u", str(ROOT / "tests" / "test_gpu_memory.py")]),
     ("client", [sys.executable, "-u", str(ROOT / "tests" / "test_client.py")]),

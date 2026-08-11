@@ -165,8 +165,11 @@ class EditLensDetector:
             return self.device, self.dtype
         try:
             import torch  # noqa: PLC0415
-        except ImportError:
-            return "unknown (torch not installed)", "unknown"
+        except Exception as exc:  # noqa: BLE001
+            # A broken Windows torch install raises OSError (WinError 126,
+            # "error loading fbgemm.dll"), not ImportError. This is the tool
+            # people call to diagnose that, so it must not raise.
+            return f"unavailable ({type(exc).__name__})", "unknown"
         device = self._requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
         return device, self._resolve_dtype_name(device)
 
@@ -231,18 +234,32 @@ class EditLensDetector:
                     self._inflight -= 1
                     self._last_used = time.monotonic()
 
+    # LOCK ORDER: always _infer_lock before _lock. _active() takes them in that
+    # order, so unload() and the watchdog must too -- acquiring _lock first and
+    # then waiting on _infer_lock deadlocks against an in-flight request.
+
+    def _unload_locked(self) -> bool:
+        """Caller must already hold _infer_lock and _lock."""
+        if not self._loaded:
+            return False
+        self.model = None
+        self.tokenizer = None
+        self._loaded = False
+        gc.collect()
+        if self.torch is not None and self.device.startswith("cuda"):
+            self.torch.cuda.empty_cache()
+        return True
+
     def unload(self) -> bool:
-        """Drop the model and release GPU memory. Reloads on the next call."""
-        with self._lock:
-            if not self._loaded:
-                return False
-            self.model = None
-            self.tokenizer = None
-            self._loaded = False
-            gc.collect()
-            if self.torch is not None and self.device.startswith("cuda"):
-                self.torch.cuda.empty_cache()
-            return True
+        """Drop the model and release GPU memory. Reloads on the next call.
+
+        Holds `_infer_lock` so it cannot null out the model or tokenizer while a
+        request is mid-flight -- otherwise a manual unload during traffic
+        surfaces as `'NoneType' object is not callable`.
+        """
+        with self._infer_lock:
+            with self._lock:
+                return self._unload_locked()
 
     def _start_watchdog(self) -> None:
         if self.idle_unload_seconds <= 0 or self._watchdog is not None:
@@ -252,15 +269,20 @@ class EditLensDetector:
             tick = min(30.0, max(5.0, self.idle_unload_seconds / 4))
             while True:
                 time.sleep(tick)
-                with self._lock:
-                    idle = time.monotonic() - self._last_used
-                    if (
-                        self._loaded
-                        and self._inflight == 0
-                        and idle > self.idle_unload_seconds
-                        and self.unload()
-                    ):
-                        self._unloads += 1
+                # Don't block traffic waiting to unload; try again next tick.
+                if not self._infer_lock.acquire(timeout=1.0):
+                    continue
+                try:
+                    with self._lock:
+                        idle = time.monotonic() - self._last_used
+                        if (
+                            self._inflight == 0
+                            and idle > self.idle_unload_seconds
+                            and self._unload_locked()
+                        ):
+                            self._unloads += 1
+                finally:
+                    self._infer_lock.release()
 
         self._watchdog = threading.Thread(
             target=loop, daemon=True, name="editlens-idle-unload"
@@ -454,8 +476,10 @@ class EditLensDetector:
         simple_txt: list[str] = []
         results: list[Verdict | None] = [None] * len(prepared)
 
-        self.ensure_loaded()
         with self._active():
+            # Inside _active(), not before it: between an outer ensure_loaded()
+            # and acquiring the lock, an unload could null the tokenizer.
+            self.ensure_loaded()
             for i, t in enumerate(prepared):
                 if not t.strip():
                     raise ValueError(f"item {i} is empty")

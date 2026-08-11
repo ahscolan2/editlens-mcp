@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from functools import wraps
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -51,7 +52,26 @@ MAX_SPAN_REPORT = 5
 def _fail(exc: Exception) -> dict:
     # str(KeyError) wraps the message in quotes; unwrap it for readability.
     msg = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
-    return {"ok": False, "error": str(msg)}
+    return {"ok": False, "error": str(msg), "error_type": type(exc).__name__}
+
+
+def _guard(fn):
+    """Every tool must return a dict, never raise.
+
+    Catching only the expected exception types is not enough: a CUDA OOM arrives
+    as a plain RuntimeError and a broken Windows torch install as an OSError, and
+    either escaping turns a diagnosable message into an opaque client-side
+    ToolError. Anything unexpected still reaches the caller -- as data.
+    """
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - deliberate tool-boundary catch
+            return _fail(exc)
+
+    return wrapper
 
 
 def _worst_spans(text: str, granularity: str = "sentence", top: int = MAX_SPAN_REPORT) -> list[dict]:
@@ -80,6 +100,7 @@ def _worst_spans(text: str, granularity: str = "sentence", top: int = MAX_SPAN_R
 
 
 @mcp.tool
+@_guard
 def detector_info() -> dict:
     """Report detector status: checkpoint, device, dtype, bucket labels, whether the
     model is loaded yet, and whether an HF token is visible. Call this first if
@@ -90,6 +111,7 @@ def detector_info() -> dict:
 
 
 @mcp.tool
+@_guard
 def detector_unload() -> dict:
     """Release the model from GPU memory immediately.
 
@@ -110,6 +132,7 @@ def detector_unload() -> dict:
 
 
 @mcp.tool
+@_guard
 def detect(
     text: Annotated[str, Field(description="The text to score.")],
     include_windows: Annotated[
@@ -135,6 +158,7 @@ def detect(
 
 
 @mcp.tool
+@_guard
 def detect_batch(
     texts: Annotated[list[str], Field(description="Texts to score in a single pass.")],
 ) -> dict:
@@ -161,6 +185,7 @@ def detect_batch(
 
 
 @mcp.tool
+@_guard
 def detect_spans(
     text: Annotated[str, Field(description="The text to break apart and score.")],
     granularity: Annotated[
@@ -220,6 +245,7 @@ def detect_spans(
 
 
 @mcp.tool
+@_guard
 def chain_create(
     name: Annotated[str, Field(description="Human-readable name for this chain.")],
     target_score: Annotated[
@@ -244,6 +270,7 @@ def chain_create(
 
 
 @mcp.tool
+@_guard
 def chain_submit(
     chain_id: Annotated[str, Field(description="Chain to append to.")],
     text: Annotated[str, Field(description="The draft to score and store.")],
@@ -300,29 +327,45 @@ def chain_submit(
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
     }
     spans: list[dict] = []
+    span_status = "skipped"  # skipped | ok | too_short | failed
     if span_feedback:
         try:
             spans = _worst_spans(text)
-        except Exception:  # noqa: BLE001 - feedback is best-effort
-            spans = []
+            span_status = "ok" if spans else "too_short"
+        except Exception as exc:  # noqa: BLE001 - never lose the draft over feedback
+            span_status = "failed"
+            # Surface it: silently returning [] here reads as "nothing to fix",
+            # which is the opposite of what a CUDA OOM or a load failure means.
+            out["span_error"] = f"{type(exc).__name__}: {exc}"
         out["worst_spans"] = spans
 
     if verdict.score <= target:
         out["next_action"] = "Target met. Stop, or call chain_assemble if other segments remain."
-    elif spans:
+    elif span_status == "ok":
         out["next_action"] = (
             "Rewrite the worst spans below in your own voice, then call chain_submit again."
         )
-    else:
-        # Too short to localise -- one sentence has nothing to rank against.
+    elif span_status == "too_short":
+        # One sentence has nothing to rank against.
         out["next_action"] = (
             "Too short to pinpoint spans. Rewrite the whole passage in your own voice, "
             "then call chain_submit again."
+        )
+    elif span_status == "failed":
+        out["next_action"] = (
+            "Span analysis failed (see span_error); the score above is still valid. "
+            "Revise and call chain_submit again."
+        )
+    else:
+        out["next_action"] = (
+            "Revise and call chain_submit again. Pass span_feedback=true, or call "
+            "detect_spans, to see which passages score worst."
         )
     return out
 
 
 @mcp.tool
+@_guard
 def chain_status(
     chain_id: Annotated[str, Field(description="Chain to inspect.")],
 ) -> dict:
@@ -351,6 +394,7 @@ def chain_status(
 
 
 @mcp.tool
+@_guard
 def chain_history(
     chain_id: Annotated[str, Field(description="Chain to read.")],
     segment: Annotated[str, Field(description="Segment whose trajectory you want.")] = "main",
@@ -361,9 +405,13 @@ def chain_history(
     Text is omitted on purpose; use `chain_get_text` for a specific step.
     """
     try:
-        store.get(chain_id)
+        known = store.segments_of(chain_id)
     except KeyError as exc:
         return _fail(exc)
+    # A mistyped segment used to return an empty trajectory indistinguishable
+    # from a real segment with no steps yet.
+    if segment not in known:
+        return _fail(KeyError(f"no such segment '{segment}' in this chain; have {known}"))
     rows = store.history(chain_id, segment, limit)
     return {
         "ok": True,
@@ -375,6 +423,7 @@ def chain_history(
 
 
 @mcp.tool
+@_guard
 def chain_get_text(
     chain_id: Annotated[str, Field(description="Chain to read from.")],
     segment: Annotated[str, Field(description="Segment to read.")] = "main",
@@ -411,6 +460,7 @@ def chain_get_text(
 
 
 @mcp.tool
+@_guard
 def chain_assemble(
     chain_id: Annotated[str, Field(description="Chain to assemble.")],
     separator: Annotated[str, Field(description="Joiner between segments.")] = "\n\n",
@@ -447,6 +497,10 @@ def chain_assemble(
         return _fail(exc)
 
     target = float(chain["target_score"])
+    # An incomplete document is not a finished one: scoring only the sections
+    # that exist and calling that "target met" invites shipping a draft with a
+    # whole section missing.
+    complete = not missing
     out: dict[str, Any] = {
         "ok": True,
         "chain_id": chain_id,
@@ -454,17 +508,25 @@ def chain_assemble(
         "document_label": verdict.label,
         "words": verdict.word_count,
         "target_score": target,
-        "target_met": verdict.score <= target,
+        "target_met": complete and verdict.score <= target,
+        "score_met": verdict.score <= target,
+        "complete": complete,
         "per_segment": per_segment,
         "missing_segments": missing,
         "windows": len(windows),
     }
+    if missing:
+        out["warning"] = (
+            f"{len(missing)} declared segment(s) have no drafts and are absent from this "
+            f"document: {missing}. The score describes only what was assembled."
+        )
     if include_text:
         out["text"] = document
     return out
 
 
 @mcp.tool
+@_guard
 def chain_list(
     limit: Annotated[int, Field(description="Most recent N chains.", ge=1, le=200)] = 25,
 ) -> dict:
@@ -473,6 +535,7 @@ def chain_list(
 
 
 @mcp.tool
+@_guard
 def chain_delete(
     chain_id: Annotated[str, Field(description="Chain to delete permanently.")],
 ) -> dict:
