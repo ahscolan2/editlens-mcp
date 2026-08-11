@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from functools import wraps
 from typing import Annotated, Any, Literal
@@ -41,11 +42,35 @@ mcp = FastMCP(
     ),
 )
 
+
+def _env_number(name: str, default, cast):
+    """Read a numeric setting, falling back rather than dying at import.
+
+    This module runs at import time, so an unusable value here kills the process
+    before the server can say anything and the MCP client just sees a launch that
+    exited. Empty is the common case -- client configs routinely emit
+    `"EDITLENS_BATCH_SIZE": ""` for an unset field -- and it is the exact failure
+    already fixed for EDITLENS_DB. EDITLENS_DEVICE/EDITLENS_DTYPE tolerate it via
+    `or None`; these two did not.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        print(
+            f"[editlens] warning: ignoring {name}={raw!r} (not a number); using {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
 detector = EditLensDetector(
     device=os.environ.get("EDITLENS_DEVICE") or None,
-    batch_size=int(os.environ.get("EDITLENS_BATCH_SIZE", "8")),
+    batch_size=_env_number("EDITLENS_BATCH_SIZE", 8, int),
     dtype=os.environ.get("EDITLENS_DTYPE") or None,
-    idle_unload_seconds=float(os.environ.get("EDITLENS_IDLE_UNLOAD", "300")),
+    idle_unload_seconds=_env_number("EDITLENS_IDLE_UNLOAD", 300.0, float),
 )
 # default_db_path() re-reads EDITLENS_DB and treats an empty value as unset.
 # Passing os.environ.get(...) here instead handed it "" and crashed at import.
@@ -371,6 +396,19 @@ def chain_submit(
             # Default parent is the previous draft; branch_from forks elsewhere.
             branch_from if branch_from is not None else (prev["step_no"] if prev else None),
         )
+    except sqlite3.IntegrityError as exc:
+        # The only foreign key on `steps` is chain_id -> chains(id), so this means
+        # the chain was deleted between the lookup above and the insert -- the
+        # window is wide because scoring sits inside it. Submitting to an
+        # already-deleted chain returns a plain "no such chain"; losing the race
+        # must not instead hand the caller "FOREIGN KEY constraint failed", which
+        # names neither the chain nor what to do about it.
+        if "foreign key" in str(exc).lower():
+            return _fail(KeyError(
+                f"no such chain: {chain_id} (deleted while this draft was being "
+                f"scored; the draft was not stored)"
+            ))
+        return _fail(exc)
     except (DetectorUnavailable, ValueError, KeyError) as exc:
         return _fail(exc)
 
@@ -619,7 +657,12 @@ def main() -> None:
     err = warmup_imports()
     if err:
         print(f"[editlens] warning: torch/transformers import failed: {err}", file=sys.stderr)
-    mcp.run(transport=os.environ.get("EDITLENS_TRANSPORT", "stdio"))
+    # `or "stdio"`, not a plain default: an EMPTY value reached fastmcp and died
+    # with `ValueError: Unknown transport: ` -- which names nothing -- and empty
+    # is what a client config emits for a field the user left blank. Same reason
+    # EDITLENS_DEVICE/EDITLENS_DTYPE use `or None` above. A genuinely wrong value
+    # still errors, but that message at least quotes what was set.
+    mcp.run(transport=os.environ.get("EDITLENS_TRANSPORT") or "stdio")
 
 
 if __name__ == "__main__":

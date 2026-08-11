@@ -264,7 +264,11 @@ class EditLensDetector:
         self.base_model = base_model
         self._requested_device = device
         self._requested_dtype = dtype
-        self.batch_size = batch_size
+        # A batch size below 1 is not a slower configuration, it is a broken one:
+        # _score_batch steps `range(0, n, batch_size)`, so 0 raises "range() arg 3
+        # must not be zero" and a negative value scores nothing and then divides by
+        # zero. Both surface on EVERY call, naming nothing the operator set.
+        self.batch_size = max(1, int(batch_size))
         self.idle_unload_seconds = idle_unload_seconds
 
         # Re-entrant: detect() -> detect_many() -> detect() nests the guard.
