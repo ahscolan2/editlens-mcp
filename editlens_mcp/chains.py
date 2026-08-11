@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS steps (
     words      INTEGER NOT NULL,
     probs      TEXT NOT NULL,
     note       TEXT,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    parent_step INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_steps_chain ON steps(chain_id, segment, step_no);
 CREATE INDEX IF NOT EXISTS idx_steps_score ON steps(chain_id, segment, score);
@@ -93,6 +94,10 @@ class ChainStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
         self._conn.executescript(SCHEMA)
+        # Databases written before branching support lack this column.
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(steps)")}
+        if "parent_step" not in cols:
+            self._conn.execute("ALTER TABLE steps ADD COLUMN parent_step INTEGER")
         self.duplicate_steps_present = False
         try:
             self._conn.execute(UNIQUE_STEP_INDEX)
@@ -239,8 +244,14 @@ class ChainStore:
         words: int,
         probs: list[float],
         note: str | None = None,
+        parent_step: int | None = None,
     ) -> int:
         """Allocate the next step number and insert, atomically.
+
+        `parent_step` records which draft this one was derived from. History is
+        append-only, so a revision that makes things worse is never destructive
+        -- but without a parent link there is no way to say "this is a second
+        attempt from step 2" rather than "this follows step 5".
 
         The MAX(step_no) read and the INSERT must share one transaction, or two
         concurrent submits both read N and both write N+1 -- after which
@@ -260,10 +271,11 @@ class ChainStore:
                     step_no = int(row["n"]) + 1
                     conn.execute(
                         "INSERT INTO steps (chain_id, segment, step_no, text, score, bucket,"
-                        " label, words, probs, note, created_at)"
-                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        " label, words, probs, note, created_at, parent_step)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                         (chain_id, segment, step_no, text, float(score), int(bucket), label,
-                         int(words), json.dumps(probs), note, now),
+                         int(words), json.dumps(probs), note, now,
+                         int(parent_step) if parent_step is not None else None),
                     )
                     conn.execute(
                         "UPDATE chains SET updated_at = ? WHERE id = ?", (now, chain_id)
@@ -297,7 +309,7 @@ class ChainStore:
 
     def history(self, chain_id: str, segment: str, limit: int = 30) -> list[dict]:
         rows = self._read(
-            "SELECT step_no, score, label, words, note, created_at FROM steps"
+            "SELECT step_no, score, label, words, note, created_at, parent_step FROM steps"
             " WHERE chain_id = ? AND segment = ? ORDER BY step_no DESC LIMIT ?",
             (chain_id, segment, limit),
         )
@@ -308,6 +320,7 @@ class ChainStore:
                 "label": r["label"],
                 "words": r["words"],
                 "note": r["note"],
+                "parent_step": r["parent_step"],
             }
             for r in reversed(rows)
         ]

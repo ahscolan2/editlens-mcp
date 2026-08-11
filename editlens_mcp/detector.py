@@ -8,6 +8,7 @@ under the softmax, normalised to [0, 1].
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import re
 import sys
@@ -133,72 +134,80 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def clean_text_with_map(text: str) -> tuple[str, list[int]]:
-    """clean_text(), plus a map from each cleaned char back to the original.
+def clean_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
+    """clean_text(), plus each cleaned char's source RANGE in the original.
 
     Callers get char offsets for the spans we flag. Those offsets used to index
     the cleaned string, which the caller never receives -- so on any text with
     CRLF line endings or double spaces they pointed at the wrong characters, and
-    a client splicing a rewrite at them would corrupt its own document. The map
-    lets offsets be reported in the caller's own coordinates.
+    a client splicing a rewrite at them would corrupt its own document.
 
-    `map[i]` is the index in `text` of cleaned character `i`.
+    `ranges[i]` is the half-open `(start, end)` slice of `text` that produced
+    cleaned character `i`. A range, not a single index, because cleaning is
+    many-to-one: `\\r\\n` collapses to one `\\n` and a run of five spaces to one
+    space. Storing only the start truncated the span before the run's last
+    character, which for CRLF left an orphaned newline behind on every splice.
     """
     # 1. newline normalisation
     c1: list[str] = []
-    i1: list[int] = []
+    r1: list[tuple[int, int]] = []
     i, n = 0, len(text)
     while i < n:
         if text[i] == "\r":
+            width = 2 if (i + 1 < n and text[i + 1] == "\n") else 1
             c1.append("\n")
-            i1.append(i)
-            i += 2 if (i + 1 < n and text[i + 1] == "\n") else 1
+            r1.append((i, i + width))
+            i += width
             continue
         c1.append(text[i])
-        i1.append(i)
+        r1.append((i, i + 1))
         i += 1
     s1 = "".join(c1)
 
     # 2. collapse runs of horizontal whitespace to one space
     c2: list[str] = []
-    i2: list[int] = []
+    r2: list[tuple[int, int]] = []
     pos = 0
     for m in _WS_RUN.finditer(s1):
         c2.extend(s1[pos : m.start()])
-        i2.extend(i1[pos : m.start()])
+        r2.extend(r1[pos : m.start()])
         c2.append(" ")
-        i2.append(i1[m.start()])
+        r2.append((r1[m.start()][0], r1[m.end() - 1][1]))
         pos = m.end()
     c2.extend(s1[pos:])
-    i2.extend(i1[pos:])
+    r2.extend(r1[pos:])
 
     # 3. rstrip each line
     c3: list[str] = []
-    i3: list[int] = []
+    r3: list[tuple[int, int]] = []
     line_start = 0
     for k in range(len(c2) + 1):
         if k == len(c2) or c2[k] == "\n":
             keep = len("".join(c2[line_start:k]).rstrip())
             c3.extend(c2[line_start : line_start + keep])
-            i3.extend(i2[line_start : line_start + keep])
+            r3.extend(r2[line_start : line_start + keep])
             if k < len(c2):
+                # The newline absorbs whatever trailing whitespace was dropped.
+                drop_end = r2[k - 1][1] if k > line_start + keep else r2[k][0]
                 c3.append("\n")
-                i3.append(i2[k])
+                r3.append((min(r2[k][0], drop_end), r2[k][1]))
             line_start = k + 1
     s3 = "".join(c3)
 
     # 4. collapse 3+ blank lines to one blank line
     c4: list[str] = []
-    i4: list[int] = []
+    r4: list[tuple[int, int]] = []
     pos = 0
     for m in _BLANKS.finditer(s3):
         c4.extend(s3[pos : m.start()])
-        i4.extend(i3[pos : m.start()])
+        r4.extend(r3[pos : m.start()])
         c4.extend("\n\n")
-        i4.extend((i3[m.start()], i3[m.start() + 1]))
+        # Second newline absorbs the whole collapsed run, so nothing is orphaned.
+        r4.append(r3[m.start()])
+        r4.append((r3[m.start() + 1][0], r3[m.end() - 1][1]))
         pos = m.end()
     c4.extend(s3[pos:])
-    i4.extend(i3[pos:])
+    r4.extend(r3[pos:])
     s4 = "".join(c4)
 
     # 5. strip
@@ -207,16 +216,29 @@ def clean_text_with_map(text: str) -> tuple[str, list[int]]:
         a += 1
     while b > a and s4[b - 1].isspace():
         b -= 1
-    return s4[a:b], i4[a:b]
+    return s4[a:b], r4[a:b]
 
 
-def map_span(imap: list[int], start: int, end: int, original_len: int) -> tuple[int, int]:
+def map_span(
+    ranges: list[tuple[int, int]], start: int, end: int, original_len: int
+) -> tuple[int, int]:
     """Translate a [start, end) span over cleaned text into original coordinates."""
-    if not imap or start >= len(imap):
+    if not ranges or start >= len(ranges) or end <= start:
         return 0, 0
-    o_start = imap[start]
-    o_end = (imap[end - 1] + 1) if 0 < end <= len(imap) else original_len
-    return o_start, min(o_end, original_len)
+    o_start = ranges[start][0]
+    o_end = ranges[min(end, len(ranges)) - 1][1]
+    return o_start, min(max(o_end, o_start), original_len)
+
+
+def text_fingerprint(text: str) -> str:
+    """Short digest of the exact string a set of offsets was computed against.
+
+    Offsets are only valid for the text that produced them: rewrite one sentence
+    and every later offset shifts. Returning a fingerprint lets a caller detect
+    that its cached offsets are stale instead of splicing at coordinates that
+    have silently moved.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
 def count_words(text: str) -> int:

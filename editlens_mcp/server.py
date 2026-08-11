@@ -25,6 +25,7 @@ from .detector import (
     count_words,
     map_span,
     split_units_adaptive,
+    text_fingerprint,
     warmup_imports,
 )
 
@@ -160,13 +161,23 @@ def detect(
     windows and combined by word-count-weighted average.
     """
     try:
-        verdict, windows = detector.detect(text)
+        source, ranges = clean_text_with_map(text)
+        if not source.strip():
+            return _fail(ValueError("empty text"))
+        verdict, windows = detector.detect(source, normalise=False)
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
     out: dict[str, Any] = {"ok": True, **verdict.as_dict()}
     out["target_hint"] = "lower is more human-like"
     if include_windows and len(windows) > 1:
+        # Window offsets, like span offsets, must index the caller's own text.
+        for w in windows:
+            w["start"], w["end"] = map_span(ranges, w["start"], w["end"], len(text))
+            w["owned_start"], w["owned_end"] = map_span(
+                ranges, w["owned_start"], w["owned_end"], len(text)
+            )
         out["window_detail"] = windows
+        out["source_fingerprint"] = text_fingerprint(text)
     return out
 
 
@@ -258,6 +269,13 @@ def detect_spans(
         "document_score": round(overall.score, 4),
         "document_label": overall.label,
         "unit_count": len(rows),
+        # Offsets are valid ONLY for text with this fingerprint. Rewrite one
+        # sentence and every later offset shifts; re-call rather than reusing.
+        "source_fingerprint": text_fingerprint(text),
+        "offsets_note": (
+            "start/end index the exact text you passed. After any edit they are "
+            "stale -- call detect_spans again, or match on `text` instead."
+        ),
         "worst_units": ranked,
     }
     if granularity == "sentence":
@@ -309,6 +327,11 @@ def chain_submit(
     span_feedback: Annotated[
         bool, Field(description="Include the worst-scoring sentences in the response.")
     ] = True,
+    branch_from: Annotated[
+        int | None,
+        Field(description="Step number this draft was derived from. Use to fork an "
+                          "alternative from an earlier draft instead of the latest one."),
+    ] = None,
 ) -> dict:
     """Submit a draft: score it, store it, and get back what to fix.
 
@@ -323,6 +346,9 @@ def chain_submit(
 
         prev = store.latest_step(chain_id, segment)
         prev_best = store.best_step(chain_id, segment)
+        if branch_from is not None and store.get_step(chain_id, segment, branch_from) is None:
+            return _fail(KeyError(f"cannot branch from step {branch_from}: no such step "
+                                  f"in segment '{segment}'"))
         # Score BEFORE registering a new segment. Registering first means a
         # failed submit -- empty text, a typo'd segment name, a CUDA OOM -- still
         # commits the segment, after which chain_assemble reports the chain
@@ -340,6 +366,8 @@ def chain_submit(
             verdict.word_count,
             verdict.probs,
             note,
+            # Default parent is the previous draft; branch_from forks elsewhere.
+            branch_from if branch_from is not None else (prev["step_no"] if prev else None),
         )
     except (DetectorUnavailable, ValueError, KeyError) as exc:
         return _fail(exc)
@@ -360,6 +388,7 @@ def chain_submit(
         "is_new_best": prev_best is None or verdict.score < prev_best["score"],
         "delta_vs_previous": round(verdict.score - prev["score"], 4) if prev else None,
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
+        "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
     }
     spans: list[dict] = []
     span_status = "skipped"  # skipped | ok | too_short | failed
@@ -373,6 +402,7 @@ def chain_submit(
             # which is the opposite of what a CUDA OOM or a load failure means.
             out["span_error"] = f"{type(exc).__name__}: {exc}"
         out["worst_spans"] = spans
+        out["source_fingerprint"] = text_fingerprint(text)
 
     if verdict.score <= target:
         out["next_action"] = "Target met. Stop, or call chain_assemble if other segments remain."

@@ -144,10 +144,16 @@ Thirteen tools. Every one returns a JSON object; failures come back as
 | `detector_info` | — | Checkpoint, platform, accelerator, device, dtype, load state, VRAM, token visibility. |
 | `detector_unload` | — | Release GPU memory now. |
 
-**Span offsets index the text you passed in.** `detect_spans` and `chain_submit` return
-`start`/`end` in your original coordinates, so you can splice a rewrite straight back. The
-`text` field on each unit is the *normalised* form the model scored (whitespace collapsed),
-which may differ from that exact slice.
+**Span offsets index the text you passed in.** `detect_spans`, `chain_submit`, and
+`detect(include_windows=true)` return `start`/`end` in your original coordinates, so you can
+splice a rewrite straight back. The `text` field on each unit is the *normalised* form the
+model scored (whitespace collapsed), which may differ from that exact slice.
+
+**Offsets go stale the moment you edit.** Rewrite one sentence and every later offset shifts.
+Each response carries a `source_fingerprint` — a digest of the exact string the offsets were
+computed from. Check it before reusing offsets you cached; if it does not match your current
+text, they have moved. For repeated rewrite cycles, matching on each unit's `text` is more
+robust than splicing by index.
 
 `detect_spans` merges short sentences toward `min_words` because the model is unreliable on
 very short inputs. If that would leave the whole text as one unit, the threshold is relaxed
@@ -166,7 +172,7 @@ numbered **steps** (revisions).
 | Tool | Parameters | What it does |
 | --- | --- | --- |
 | `chain_create` | `name`, `target_score=0.25`, `goal=null`, `segments=null` | Open a chain. Duplicate segment names are de-duplicated. |
-| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true` | Score and store a draft; returns movement and worst spans, **not** the text. |
+| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. |
 | `chain_status` | `chain_id` | Per-segment best/latest scores and what is still pending. |
 | `chain_history` | `chain_id`, `segment="main"`, `limit=30` | Score trajectory. Numbers and notes only. |
 | `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve a stored draft — `"best"`, `"latest"`, or a step number. |
@@ -209,6 +215,21 @@ chain_assemble(ch)                          ← best-of-each, scored as one docu
 
 Assemble at the end, always. A document routinely scores higher than any of its parts,
 because the model sees consistency across sections it cannot see in one section alone.
+
+**When a revision makes things worse**, history is append-only — nothing is lost. Pull the
+earlier draft back and fork from it, and the chain records the branch:
+
+```
+chain_submit(ch, draft_5)                          → 0.71   worse than step 2
+chain_get_text(ch, step=2)                         → the draft that worked
+chain_submit(ch, new_attempt, branch_from=2)       → step 6, parent_step=2
+chain_history(ch)                                  → [(1,None), (2,1), … (6,2)]
+```
+
+`chain_history` reports each step's `parent_step`, so several attempts from the same
+ancestor are distinguishable from a straight line of revisions. `chain_get_text(step="best")`
+and `chain_assemble` always use the lowest-scoring draft regardless of branch, so a bad
+detour never costs you the good one.
 
 To widen rather than deepen: generate several candidates per step and use `detect_batch` to
 keep the best before submitting. That converges in fewer chain steps than revising a single
@@ -281,11 +302,11 @@ Default database location:
 python run_tests.py
 ```
 
-Seven suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
+Eight suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
 including error paths; SQLite concurrency and cross-process step allocation; span-offset
-correctness; precision, windowing, edge cases and determinism; GPU idle-unload and threading
-under load; and the real path — the server as a stdio subprocess, which is what MCP clients
-actually do.
+correctness; branching and offset staleness; precision, windowing, edge cases and
+determinism; GPU idle-unload and threading under load; and the real path — the server as a
+stdio subprocess, which is what MCP clients actually do.
 
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.

@@ -43,11 +43,13 @@ def test_map_span_round_trip():
         b = min(a + 25, len(cleaned))
         o0, o1 = map_span(imap, a, b, len(MESSY))
         assert 0 <= o0 <= o1 <= len(MESSY)
-        # First non-space character must match through the mapping.
-        assert MESSY[o0] == cleaned[a] or cleaned[a] == " ", (
-            f"span {a}:{b} -> {o0}:{o1}: {MESSY[o0]!r} vs {cleaned[a]!r}"
+        # The mapped slice must carry the same words as the cleaned slice.
+        # Exact character equality cannot hold: cleaning collapses CRLF to LF
+        # and space runs to one, so the original slice legitimately holds more.
+        assert MESSY[o0:o1].split() == cleaned[a:b].split(), (
+            f"span {a}:{b} -> {o0}:{o1}: {MESSY[o0:o1]!r} vs {cleaned[a:b]!r}"
         )
-    print("  all mapped spans land on the matching original character")
+    print("  all mapped spans carry the same words as the cleaned slice")
 
 
 async def _spans_from_server():
@@ -93,7 +95,7 @@ def test_clean_text_offsets_unchanged_when_text_is_already_clean():
     tidy = "One sentence here. Another sentence follows. A third one closes it."
     cleaned, imap = clean_text_with_map(tidy)
     assert cleaned == tidy
-    assert imap == list(range(len(tidy))), "identity map expected for already-clean text"
+    assert imap == [(i, i + 1) for i in range(len(tidy))], "identity ranges expected"
     print("  already-clean text maps to itself")
 
 
