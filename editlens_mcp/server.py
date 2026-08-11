@@ -38,7 +38,16 @@ mcp = FastMCP(
         "drive that score. For iterative work, open a chain with `chain_create`, then call "
         "`chain_submit` after every draft: it stores the text on disk and returns only the score "
         "delta plus the worst spans, so a chain can run for hundreds of steps cheaply. "
-        "Use `chain_assemble` to score the concatenation of a multi-section chain."
+        "Use `chain_assemble` to score the concatenation of a multi-section chain. "
+        "Every chain tool returns a `next_action` -- follow it rather than inferring a plan "
+        "from the scores, because two things about those scores are counter-intuitive. "
+        "First, scores are not comparable across lengths: the model scores a sentence or a "
+        "section harder than the same words inside a whole document, so parts routinely score "
+        "far above the document they compose, and the document score is the one that decides "
+        "whether you are finished. Second, chain history is append-only and nothing is ever "
+        "overwritten, so when a revision scores worse the fix is to go back -- "
+        "`chain_get_text(step='best')` to read the better draft, then `chain_submit` with "
+        "`branch_from` set to that step -- not to keep editing the worse one."
     ),
 )
 
@@ -79,6 +88,21 @@ store = ChainStore(default_db_path())
 MAX_SPAN_REPORT = 5
 # Below this the model's score is indicative rather than precise.
 RELIABLE_WORDS = 25
+# How much worse than the best draft counts as a regression worth recovering
+# from, rather than run-to-run noise.
+REGRESSION_DELTA = 0.05
+
+# The detector is a document-level classifier, and it scores short text harder
+# than the same prose inside a longer document. Both directions were observed
+# driving this server for real: a 96-word paragraph scored 0.299 while every one
+# of its sentence-groups scored 0.20 or below, and a four-section report
+# assembled to 0.108 from sections scoring up to 0.733. So a caller cannot
+# compare a fragment's score to a document's, and every place this server hands
+# back both numbers has to say which one decides.
+SCALE_NOTE = (
+    "Scores are not comparable across lengths: the model scores short fragments "
+    "harder than the same words inside a full document."
+)
 
 
 def _fail(exc: Exception) -> dict:
@@ -106,11 +130,22 @@ def _guard(fn):
     return wrapper
 
 
-def _worst_spans(text: str, granularity: str = "sentence", top: int = MAX_SPAN_REPORT) -> list[dict]:
+def _worst_spans(
+    text: str,
+    granularity: str = "sentence",
+    top: int = MAX_SPAN_REPORT,
+    target: float | None = None,
+) -> list[dict]:
     """Score sentence-groups and return the highest-scoring ones.
 
     `start`/`end` index the caller's ORIGINAL text, not the normalised copy the
     model sees -- offsets you cannot splice against are worse than no offsets.
+
+    `above_target` marks the spans actually worth rewriting. Without it the
+    caller sees five spans under a heading that says "worst" and rewrites all
+    five -- including ones the same response labels Human-written, which is how
+    a revision loop makes a draft worse while believing it is following
+    instructions.
     """
     source, imap = clean_text_with_map(text)
     units, _ = split_units_adaptive(source, granularity=granularity)
@@ -120,16 +155,17 @@ def _worst_spans(text: str, granularity: str = "sentence", top: int = MAX_SPAN_R
     rows = []
     for (a, b), v in zip(units, verdicts):
         o0, o1 = map_span(imap, a, b, len(text))
-        rows.append(
-            {
-                "start": o0,
-                "end": o1,
-                "score": round(v.score, 4),
-                "label": v.label,
-                "words": v.word_count,
-                "text": source[a:b],
-            }
-        )
+        row = {
+            "start": o0,
+            "end": o1,
+            "score": round(v.score, 4),
+            "label": v.label,
+            "words": v.word_count,
+            "text": source[a:b],
+        }
+        if target is not None:
+            row["above_target"] = v.score > target
+        rows.append(row)
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows[:top]
 
@@ -217,6 +253,12 @@ def detect_batch(
 
     Use this to compare candidate drafts side by side -- generate N variants,
     score them together, keep the lowest.
+
+    Treat these scores as a RANKING, not as a verdict. When the candidates are
+    sentences or sections rather than whole documents, all of them will score
+    higher than the document they end up in, so do not discard a whole batch for
+    missing a document-level target -- pick the lowest, splice it in, and score
+    the result with `detect`.
     """
     if not texts:
         return _fail(ValueError("texts is empty"))
@@ -232,6 +274,13 @@ def detect_batch(
         "best_index": best["index"],
         "best_score": best["score"],
         "mean_score": round(sum(r["score"] for r in results) / len(results), 4),
+        # Observed: three candidate paragraphs scored 0.50/0.99/0.66, and the
+        # best one spliced into its document took that document to 0.06. A
+        # caller comparing best_score against its target rejects all three.
+        "comparison_note": (
+            f"Use these to rank the candidates against each other. {SCALE_NOTE} "
+            f"Re-score with `detect` after splicing the winner in."
+        ),
     }
 
 
@@ -360,11 +409,22 @@ def chain_submit(
                           "alternative from an earlier draft instead of the latest one."),
     ] = None,
 ) -> dict:
-    """Submit a draft: score it, store it, and get back what to fix.
+    """Submit a draft: score it, score its parts, store it, and say what to do next.
 
     The response is deliberately compact -- score, movement against the previous
     and best steps, target status, and the worst spans. The draft text itself is
     kept on disk, not echoed back, so you can iterate indefinitely.
+
+    Read `next_action` first; it accounts for the three cases that are easy to
+    get wrong. Rewrite only spans marked `above_target` -- the list is worst-first,
+    not a to-do list, and the tail of it is usually text that is already fine.
+    History is append-only, so a draft that scores worse costs you nothing:
+    `best_step` names the best draft, `chain_get_text` retrieves it and
+    `branch_from` continues from it.
+
+    Span scores and the document score are not on one scale -- short fragments
+    score higher than the same words in a full document -- so the spans can all
+    sit below target while the document stays above it.
     """
     try:
         chain = store.get(chain_id)
@@ -413,7 +473,13 @@ def chain_submit(
         return _fail(exc)
 
     target = float(chain["target_score"])
+    is_new_best = prev_best is None or verdict.score < prev_best["score"]
     best_score = min(verdict.score, prev_best["score"]) if prev_best else verdict.score
+    # The step NUMBER of the best draft, not just its score. branch_from takes a
+    # step number, so a response that reports best_score without best_step tells
+    # the caller a better draft exists but not how to reach it -- it has to go
+    # back through chain_status or chain_history to recover its own history.
+    best_step = step_no if is_new_best else prev_best["step_no"]
     out: dict[str, Any] = {
         "ok": True,
         "chain_id": chain_id,
@@ -425,7 +491,8 @@ def chain_submit(
         "target_score": target,
         "target_met": verdict.score <= target,
         "best_score": round(best_score, 4),
-        "is_new_best": prev_best is None or verdict.score < prev_best["score"],
+        "best_step": best_step,
+        "is_new_best": is_new_best,
         "delta_vs_previous": round(verdict.score - prev["score"], 4) if prev else None,
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
         "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
@@ -434,7 +501,7 @@ def chain_submit(
     span_status = "skipped"  # skipped | ok | too_short | failed
     if span_feedback:
         try:
-            spans = _worst_spans(text)
+            spans = _worst_spans(text, target=target)
             span_status = "ok" if spans else "too_short"
         except Exception as exc:  # noqa: BLE001 - never lose the draft over feedback
             span_status = "failed"
@@ -442,13 +509,50 @@ def chain_submit(
             # which is the opposite of what a CUDA OOM or a load failure means.
             out["span_error"] = f"{type(exc).__name__}: {exc}"
         out["worst_spans"] = spans
+        out["spans_above_target"] = sum(1 for s in spans if s.get("above_target"))
         out["source_fingerprint"] = text_fingerprint(text)
+
+    # A draft that lost ground against the best one is the case where "keep
+    # revising" is the wrong instruction: the caller already holds a better
+    # draft and every further edit compounds off the worse one. Recovering means
+    # chain_get_text + branch_from, and neither appears anywhere in a response
+    # unless it is said here -- observed for real, where a step went 0.035 ->
+    # 0.999 and next_action still just said "rewrite the worst spans".
+    regressed = (
+        prev_best is not None
+        and not is_new_best
+        and (
+            verdict.score - prev_best["score"] > REGRESSION_DELTA
+            or (prev_best["score"] <= target < verdict.score)
+        )
+    )
 
     if verdict.score <= target:
         out["next_action"] = "Target met. Stop, or call chain_assemble if other segments remain."
+    elif regressed:
+        out["next_action"] = (
+            f"Worse than step {best_step} ({round(prev_best['score'], 4)} vs "
+            f"{round(verdict.score, 4)}). Do not keep editing this draft. Call "
+            f"chain_get_text(step={best_step}) to recover the better one, then submit your "
+            f"next attempt with branch_from={best_step}. Nothing is lost -- this draft "
+            f"stays in the history as step {step_no}."
+        )
+    elif span_status == "ok" and out["spans_above_target"] == 0:
+        # Every span is already at or below target and the document is not. More
+        # span-hunting cannot help; the caller has to act on the whole passage.
+        # Left as "rewrite the worst spans", this is an infinite loop that asks a
+        # model to rewrite sentences the same response calls Human-written.
+        out["next_action"] = (
+            f"No span scores above the target -- span-level rewriting has bottomed out, so "
+            f"do not rewrite the spans below. {SCALE_NOTE} Whatever is left is document-level: "
+            f"try reordering, cutting the opening or closing sentence, varying sentence "
+            f"length, or rewriting the passage from scratch. Then call chain_submit again."
+        )
     elif span_status == "ok":
         out["next_action"] = (
-            "Rewrite the worst spans below in your own voice, then call chain_submit again."
+            f"Rewrite the {out['spans_above_target']} span(s) below marked above_target=true "
+            f"in your own voice, then call chain_submit again. Leave the rest alone -- they "
+            f"are already at or below target."
         )
     elif span_status == "too_short":
         # One sentence has nothing to rank against.
@@ -474,8 +578,14 @@ def chain_submit(
 def chain_status(
     chain_id: Annotated[str, Field(description="Chain to inspect.")],
 ) -> dict:
-    """Per-segment summary of a chain: step counts, best and latest scores, and
-    which segments still miss the target."""
+    """Per-segment summary of a chain, and what to do next.
+
+    `pending` is every segment not yet at target, which mixes two situations
+    needing opposite responses; `unstarted` and `above_target` split them.
+    `target_met` and assembly both use each segment's BEST draft, so a segment
+    whose latest draft is worse still counts as met -- `latest_is_best` says
+    whether the draft you last submitted is the one that will be assembled.
+    """
     try:
         chain = store.get(chain_id)
     except KeyError as exc:
@@ -485,7 +595,11 @@ def chain_status(
     stats = [store.segment_stats(chain_id, s) for s in segs]
     for s in stats:
         s["target_met"] = s["best_score"] is not None and s["best_score"] <= target
-    return {
+        s["latest_is_best"] = s["steps"] > 0 and s["latest_step"] == s["best_step"]
+    unstarted = [s["segment"] for s in stats if s["steps"] == 0]
+    above = [s["segment"] for s in stats if s["steps"] > 0 and not s["target_met"]]
+    stale = [s["segment"] for s in stats if s["steps"] > 0 and not s["latest_is_best"]]
+    out = {
         "ok": True,
         "chain_id": chain_id,
         "name": chain["name"],
@@ -495,7 +609,39 @@ def chain_status(
         "total_steps": sum(s["steps"] for s in stats),
         "all_targets_met": all(s["target_met"] for s in stats) if stats else False,
         "pending": [s["segment"] for s in stats if not s["target_met"]],
+        "unstarted": unstarted,
+        "above_target": above,
+        "segments_with_better_earlier_draft": stale,
     }
+    # Without this a caller reads `pending` and starts revising, when the thing
+    # to do first is usually to assemble: a whole document routinely scores far
+    # below its own sections, so sections listed here as failing can already be
+    # good enough and the revision is wasted.
+    if not stats:
+        out["next_action"] = "This chain declares no segments."
+    elif unstarted:
+        out["next_action"] = (
+            f"Draft the segment(s) with no steps yet: {unstarted}. Call chain_submit "
+            f"with segment='{unstarted[0]}'."
+        )
+    elif above:
+        out["next_action"] = (
+            f"Call chain_assemble first: {SCALE_NOTE} The assembled document often "
+            f"scores below every section that failed on its own, and the document score "
+            f"is what decides completion. Only if the document is still above target, "
+            f"revise {above} with chain_submit."
+        )
+    else:
+        out["next_action"] = (
+            "Every segment meets target. Call chain_assemble to score the whole "
+            "document -- assembly is what decides completion, not these per-segment scores."
+        )
+    if stale:
+        out["next_action"] += (
+            f" Note: in {stale} your latest draft scores worse than an earlier one; "
+            f"assembly will use the earlier one. chain_get_text(step='best') retrieves it."
+        )
+    return out
 
 
 @mcp.tool
@@ -573,8 +719,13 @@ def chain_assemble(
 ) -> dict:
     """Join the best draft of every segment in order and score the whole document.
 
-    A document can score higher than any of its parts, so always assemble before
-    calling a multi-segment chain finished.
+    Always assemble before calling a multi-segment chain finished: the document
+    score is the one that counts, and it is NOT bounded by the section scores in
+    either direction. A document can come out above every section it is made of,
+    and it can come out far below them -- sections scoring 0.73 and 0.51 have
+    assembled into a 0.11 document, because the model scores short text harder
+    than the same words inside a longer piece. So assemble before you decide a
+    section needs more work, not after.
     """
     try:
         chain = store.get(chain_id)
@@ -620,10 +771,36 @@ def chain_assemble(
         "missing_segments": missing,
         "windows": len(windows),
     }
+    # chain_status calls these segments pending; this tool may simultaneously
+    # report the document as finished. Both are true, and a caller given the two
+    # answers with nothing to reconcile them either revises text that is already
+    # good or ships while believing it is behind.
+    above = [p["segment"] for p in per_segment if p["score"] > target]
+    out["segments_above_target"] = above
     if missing:
         out["warning"] = (
             f"{len(missing)} declared segment(s) have no drafts and are absent from this "
             f"document: {missing}. The score describes only what was assembled."
+        )
+        out["next_action"] = (
+            f"Incomplete: draft {missing} with chain_submit, then assemble again. The "
+            f"score above covers only the sections that exist."
+        )
+    elif verdict.score <= target:
+        out["next_action"] = "Document meets target and every segment has a draft. Done."
+        if above:
+            out["next_action"] += (
+                f" Segments {above} score above target ON THEIR OWN, and chain_status will "
+                f"list them as pending -- ignore that. {SCALE_NOTE} The document score is "
+                f"what decides completion, and it passed."
+            )
+    else:
+        worst = max(per_segment, key=lambda p: p["score"])["segment"]
+        out["next_action"] = (
+            f"Document scores {round(verdict.score, 4)}, above the target {target}. Call "
+            f"detect_spans on the assembled text above to find which passages drive it -- "
+            f"section scores are a poor guide here. Otherwise revise segment "
+            f"'{worst}' with chain_submit and assemble again."
         )
     if include_text:
         out["text"] = document
