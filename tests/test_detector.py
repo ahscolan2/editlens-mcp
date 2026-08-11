@@ -8,7 +8,7 @@ TMP = Path(tempfile.mkdtemp())
 os.environ["EDITLENS_DB"] = str(TMP / "v.db")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from editlens_mcp.detector import EditLensDetector, count_words, pick_device
+from editlens_mcp.detector import EditLensDetector, clean_text, count_words, pick_device
 
 import torch  # noqa: E402
 
@@ -106,6 +106,92 @@ def test_long_text(det):
     return True
 
 
+def test_window_weighting_is_exact(det):
+    """The document score IS the word-weighted mean over the owned ranges.
+
+    The assertions in test_long_text only inspect the ranges the detector
+    reports; none of them looks at what the combined score was actually built
+    from. Restoring a plain unweighted mean therefore passed every one of them.
+
+    Feed the combiner known per-window scores so the arithmetic is checkable to
+    the bit, rather than hoping two real windows disagree enough for a tolerance
+    to notice. The weights are recomputed here from `owned_start`/`owned_end`, so
+    weighting by each window's FULL span (which double-counts the overlaps) is
+    caught too.
+    """
+    print("\n=== window combination is word-weighted, exactly ===")
+    doc = (TEXTS[0] + " " + TEXTS[2] + " ") * 12
+    source = clean_text(doc)
+
+    def fake_scores(texts):
+        n = max(len(texts), 2)
+        return [(i / (n - 1), [1.0 - i / (n - 1), i / (n - 1), 0.0, 0.0])
+                for i in range(len(texts))]
+
+    real = det._score_batch
+    det._score_batch = fake_scores
+    try:
+        v, details = det.detect(doc)
+    finally:
+        det._score_batch = real
+
+    assert len(details) > 1, f"need a multi-window document, got {len(details)}"
+    n = max(len(details), 2)
+    weights, scores = [], []
+    for i, d in enumerate(details):
+        w = float(count_words(source[d["owned_start"]:d["owned_end"]])) or 1.0
+        weights.append(w)
+        scores.append(i / (n - 1))
+        assert d["words"] == int(w), (
+            f"window {i} was weighted by {d['words']} words but owns {int(w)}")
+
+    expected = sum(s * w for s, w in zip(scores, weights)) / sum(weights)
+    plain = sum(scores) / len(scores)
+    assert abs(expected - plain) > 1e-6, (
+        "these windows are equal-weight, so the test cannot tell a weighted mean "
+        "from an unweighted one -- pick a document where they differ")
+    assert abs(v.score - expected) < 1e-9, (
+        f"score {v.score!r} is not the word-weighted mean {expected!r} "
+        f"(an unweighted mean would give {plain!r})")
+    # The probability vector is combined the same way, and stays a distribution.
+    assert abs(v.probs[1] - expected) < 1e-9, (v.probs, expected)
+    assert abs(sum(v.probs) - 1.0) < 1e-9, v.probs
+    # And bucket/label still follow from the score.
+    assert v.bucket == int(round(v.score * 3)), (v.bucket, v.score)
+    assert v.label == det.bucket_names[v.bucket], (v.label, v.bucket)
+    print(f"  {len(details)} windows, weights {[int(w) for w in weights]}")
+    print(f"  score={v.score:.9f} == weighted {expected:.9f} "
+          f"(unweighted would be {plain:.9f})")
+
+
+def test_batch_agrees_with_single(det):
+    """detect_batch must return the same number detect does for the same text.
+
+    They are separate code paths -- detect_many has a one-shot batched fast path
+    for short inputs, detect always windows -- and detect_batch exists so drafts
+    can be compared against each other and against earlier detect calls. If the
+    two paths normalise differently, or derive bucket and label differently,
+    those comparisons quietly stop meaning anything.
+    """
+    print("\n=== batched path agrees with the single path ===")
+    messy = [
+        "  In today's  rapidly evolving landscape,\r\n stakeholders must leverage "
+        "synergies to drive transformative outcomes.   ",
+        "I burnt the rice again.\r\n\r\n\r\n\r\nThird time this month.   We had toast "
+        "instead, which was fine.",
+    ]
+    batch = det.detect_many(messy)
+    assert len(batch) == len(messy)
+    for v, t in zip(batch, messy):
+        single, _ = det.detect(t)
+        assert abs(v.score - single.score) < 1e-6, (t[:30], v.score, single.score)
+        assert v.bucket == single.bucket and v.label == single.label
+        assert v.word_count == single.word_count, (v.word_count, single.word_count)
+        assert v.label == det.bucket_names[v.bucket]
+        assert 0.0 <= v.score <= 1.0
+    print(f"  {len(messy)} messy inputs: batched and single scores identical")
+
+
 def test_edges(det):
     print("\n=== edge cases ===")
     cases = {
@@ -177,6 +263,8 @@ if __name__ == "__main__":
     det = EditLensDetector(device=DEVICE)
     det.ensure_loaded()
     test_long_text(det)
+    test_window_weighting_is_exact(det)
+    test_batch_agrees_with_single(det)
     test_edges(det)
     test_determinism(det)
     asyncio.run(test_multisegment_and_restart())

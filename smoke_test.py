@@ -93,12 +93,22 @@ def test_real_model() -> None:
     det.ensure_loaded()
     print(f"  loaded on {det.device} ({det.dtype}), {det.n_buckets} buckets")
     ai, human = SAMPLE.split("\n\n")
+    singles = []
     for name, txt in (("ai-ish", ai), ("human-ish", human)):
         v, _ = det.detect(txt)
+        singles.append(v)
+        # Printing a number proves nothing about it. The README promises a score
+        # in [0,1] together with the matching bucket label; check both.
+        assert 0.0 <= v.score <= 1.0, v.score
+        assert v.label == det.bucket_names[v.bucket], (v.label, v.bucket)
+        assert v.bucket == round(v.score * (det.n_buckets - 1)), (v.bucket, v.score)
+        assert abs(sum(v.probs) - 1.0) < 1e-4, v.probs
         print(f"    {name:<10} score={v.score:.3f}  {v.label}")
     batch = det.detect_many([ai, human])
     assert len(batch) == 2
-    print("  real model ok")
+    for b, s in zip(batch, singles):
+        assert abs(b.score - s.score) < 1e-6, (b.score, s.score)
+    print("  real model ok  (score/bucket/label agree, batch matches single)")
 
 
 if __name__ == "__main__":

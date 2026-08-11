@@ -19,6 +19,7 @@ os.environ["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "tools.db")
 from fastmcp import Client  # noqa: E402
 
 from editlens_mcp import server  # noqa: E402
+from editlens_mcp.detector import Verdict  # noqa: E402
 
 AI = ("In today's rapidly evolving landscape, stakeholders must leverage synergies to "
       "drive transformative outcomes across the organizational ecosystem. Moreover, it "
@@ -48,6 +49,12 @@ async def main() -> None:
         info = await call("detector_info")
         assert info["ok"] is True
         assert info["checkpoint"] and info["db_path"]
+        # Not merely truthy: EDITLENS_DB is how a client keeps its chains out of
+        # the shared default database, and silently ignoring it would send every
+        # test in this file at %LOCALAPPDATA%.
+        assert Path(info["db_path"]) == Path(os.environ["EDITLENS_DB"]), (
+            info["db_path"], os.environ["EDITLENS_DB"])
+        assert Path(info["db_path"]).exists(), "store did not create its database"
         assert info["dtype"] in {"float32", "float16"}
         assert info["accelerator"] in {"cuda", "mps", "cpu"}
         # Guards the mutation "always return float16": the default must be float32.
@@ -65,6 +72,33 @@ async def main() -> None:
         assert ai["score"] > hu["score"] + 0.2, (ai["score"], hu["score"])
         print(f"  detect: ai={ai['score']:.3f} > human={hu['score']:.3f}")
 
+        # ------------------------------------------- score / bucket / label agree
+        # The README promises a score in [0,1] "along with the discrete bucket
+        # label and the full probability distribution". Range alone is a weak
+        # promise: it holds for any number between 0 and 1. These three are the
+        # SAME quantity in three forms, and they must stay derivable from one
+        # another -- the score is the expected bucket index under the softmax,
+        # normalised to [0,1]; the bucket is that score put back on the index
+        # scale; the label is that bucket's name. Without this, mutations that
+        # returned the argmax instead of the expectation, scaled the score, or
+        # shifted the label by one bucket all passed every suite.
+        loaded = await call("detector_info")
+        names, nb = loaded["bucket_names"], loaded["n_buckets"]
+        assert len(names) == nb, (names, nb)
+        for tag, r in (("ai", ai), ("human", hu)):
+            expected = sum(i * p for i, p in enumerate(r["probs"])) / (nb - 1)
+            assert abs(r["score"] - expected) < 0.002, (
+                f"{tag}: score {r['score']} is not the expectation over probs "
+                f"{r['probs']} ({expected:.4f})")
+            assert r["bucket"] == int(round(r["score"] * (nb - 1))), (
+                f"{tag}: bucket {r['bucket']} does not match score {r['score']}")
+            assert 0 <= r["bucket"] < nb, r["bucket"]
+            assert r["label"] == names[r["bucket"]], (
+                f"{tag}: label {r['label']!r} is not bucket {r['bucket']} "
+                f"({names[r['bucket']]!r})")
+        print(f"  score/bucket/label consistent: ai -> bucket {ai['bucket']} "
+              f"'{ai['label']}', human -> bucket {hu['bucket']} '{hu['label']}'")
+
         long_doc = (AI + " " + HUMAN + " ") * 12
         win = await call("detect", {"text": long_doc, "include_windows": True})
         assert win["ok"] and win["windows"] > 1, win["windows"]
@@ -80,6 +114,16 @@ async def main() -> None:
             f"window weights {total} != document words {win['word_count']}")
         print(f"  detect(include_windows): {win['windows']} windows partition cleanly")
 
+        # The flag is a flag: the same document without it must stay compact.
+        # chain_submit is called after every draft, so leaking per-window detail
+        # into the default response is the difference between a chain that runs
+        # for hundreds of steps and one that fills the context window.
+        plain_long = await call("detect", {"text": long_doc})
+        assert plain_long["ok"] and plain_long["windows"] == win["windows"]
+        assert "window_detail" not in plain_long, "include_windows=False must omit detail"
+        assert plain_long["score"] == win["score"], "the flag must not change the score"
+        print("  detect(default): same score, no window_detail")
+
         # ----------------------------------------------------------- detect_batch
         batch = await call("detect_batch", {"texts": [AI, HUMAN, AI]})
         assert batch["ok"] and len(batch["results"]) == 3
@@ -87,7 +131,14 @@ async def main() -> None:
         assert batch["best_index"] == 1, batch["best_index"]
         assert batch["best_score"] == min(r["score"] for r in batch["results"])
         assert abs(batch["results"][0]["score"] - batch["results"][2]["score"]) < 1e-6
-        print(f"  detect_batch: best_index={batch['best_index']}, duplicates agree")
+        assert abs(batch["mean_score"]
+                   - sum(r["score"] for r in batch["results"]) / 3) < 0.001
+        for r in batch["results"]:
+            assert r["label"] == names[r["bucket"]], (r["label"], r["bucket"])
+            assert abs(r["score"]
+                       - sum(i * p for i, p in enumerate(r["probs"])) / (nb - 1)) < 0.002
+        print(f"  detect_batch: best_index={batch['best_index']}, duplicates agree, "
+              f"labels match buckets")
 
         # ----------------------------------------------------------- detect_spans
         spans = await call("detect_spans", {"text": AI + " " + HUMAN, "top": 10})
@@ -100,8 +151,37 @@ async def main() -> None:
         for u in spans["worst_units"]:
             assert isinstance(u["reliable"], bool)
             assert u["start"] < u["end"]
+            # `reliable` is a claim about this unit, not decoration: the docstring
+            # says units under ~25 words are indicative rather than precise. Only
+            # asserting isinstance(bool) let "always reliable" pass.
+            assert u["reliable"] == (u["words"] >= 25), (
+                f"unit {u['unit']}: {u['words']} words but reliable={u['reliable']}")
+            # The offsets must slice the caller's own text back out.
+            assert (AI + " " + HUMAN)[u["start"]:u["end"]].split() == u["text"].split()
         print(f"  detect_spans: {spans['unit_count']} units, sorted, "
-              f"{spans['unreliable_units']} unreliable")
+              f"{spans['unreliable_units']} unreliable, reliable flag matches word count")
+
+        # unreliable_units counts EVERY unit, not just the ones reported back.
+        all_units = await call("detect_spans",
+                               {"text": AI + " " + HUMAN, "top": 50, "min_words": 1})
+        assert all_units["unit_count"] == len(all_units["worst_units"])
+        assert all_units["unreliable_units"] == sum(
+            1 for u in all_units["worst_units"] if u["words"] < 25), (
+            all_units["unreliable_units"],
+            [u["words"] for u in all_units["worst_units"]])
+
+        # Adaptive relaxation: two short sentences cannot reach a 25-word merge
+        # threshold, so the splitter must back off rather than hand back one unit
+        # covering everything -- and must report the threshold it settled on.
+        tiny = "The cat sat down. The dog stood up."
+        relaxed = await call("detect_spans", {"text": tiny, "min_words": 25})
+        assert relaxed["ok"], relaxed
+        assert relaxed["unit_count"] >= 2, (
+            f"min_words=25 swallowed a short text whole: {relaxed['unit_count']} unit(s)")
+        assert relaxed["granularity_relaxed"] is True
+        assert relaxed["min_words_used"] < 25, relaxed["min_words_used"]
+        print(f"  detect_spans(min_words=25 on a short text): relaxed to "
+              f"{relaxed['min_words_used']}, {relaxed['unit_count']} units")
 
         para = await call("detect_spans",
                           {"text": AI + "\n\n" + HUMAN, "granularity": "paragraph"})
@@ -146,6 +226,117 @@ async def main() -> None:
         assert "warning" in part
         print(f"  chain_assemble(partial): complete=False target_met=False "
               f"missing={part['missing_segments']}")
+
+        # The completeness gate, without leaning on what the model returns.
+        # target_score=1.0 makes score_met true for ANY score, so target_met can
+        # only be false because a segment is missing. The previous check happened
+        # to pass for the other reason too, which made it a weak guard.
+        loose = await call("chain_create",
+                           {"name": "loose", "target_score": 1.0, "segments": ["p", "q"]})
+        lid = loose["chain_id"]
+        await call("chain_submit", {"chain_id": lid, "text": HUMAN, "segment": "p",
+                                    "span_feedback": False})
+        la = await call("chain_assemble", {"chain_id": lid, "include_text": False})
+        assert la["score_met"] is True, la["document_score"]
+        assert la["complete"] is False and la["missing_segments"] == ["q"]
+        assert la["target_met"] is False, (
+            "a document missing a whole section reported target_met with "
+            f"score_met={la['score_met']}")
+        print("  chain_assemble: target_met stays False on an incomplete document "
+              "even when the score passes")
+
+        # A submit that FAILS must not leave its segment registered. Registering
+        # first means a typo'd segment name (or an OOM) permanently marks the
+        # chain incomplete with no way to remove the segment again.
+        segs_before = [s["segment"] for s in
+                       (await call("chain_status", {"chain_id": lid}))["segments"]]
+        ghost = await call("chain_submit", {"chain_id": lid, "text": "   ",
+                                            "segment": "typoo"})
+        assert ghost["ok"] is False, ghost
+        segs_after = [s["segment"] for s in
+                      (await call("chain_status", {"chain_id": lid}))["segments"]]
+        assert segs_after == segs_before, (
+            f"a failed submit registered segment(s): {set(segs_after) - set(segs_before)}")
+        asm_after = await call("chain_assemble", {"chain_id": lid, "include_text": False})
+        assert "typoo" not in asm_after["missing_segments"], asm_after["missing_segments"]
+        print(f"  failed chain_submit left segments untouched: {segs_after}")
+
+        # Span feedback is the point of chain_submit's compact response: the
+        # WORST few units, worst first, capped. Only asserting it is non-empty
+        # left the ordering and the cap untested.
+        many = " ".join(
+            f"Sentence number {i} exists here and says something fairly plain about "
+            f"the weather outside in an ordinary way." for i in range(12))
+        spanned = await call("chain_submit", {"chain_id": lid, "text": many,
+                                              "segment": "q"})
+        assert spanned["ok"], spanned
+        ws = spanned["worst_spans"]
+        assert 0 < len(ws) <= 5, f"worst_spans should be capped at 5, got {len(ws)}"
+        ss = [u["score"] for u in ws]
+        assert ss == sorted(ss, reverse=True), f"worst_spans not worst-first: {ss}"
+        for u in ws:
+            assert many[u["start"]:u["end"]].split() == u["text"].split(), u
+        print(f"  chain_submit worst_spans: {len(ws)} of many, worst-first, "
+              f"offsets slice the submitted text")
+
+        # --------------------------------------------- exact scoring arithmetic
+        # target_score is documented as "stop when the score is at or below this",
+        # and the deltas are the only thing a caller sees between drafts. A real
+        # model never lands on a round number, so substitute known scores and
+        # check the arithmetic and the boundary exactly, instead of asserting
+        # loose inequalities that a sign flip or a `<` for `<=` slips through.
+        def stub(score):
+            v = Verdict(score=score, bucket=int(round(score * (nb - 1))),
+                        label=names[int(round(score * (nb - 1)))],
+                        probs=[0.25] * nb, word_count=9, char_count=40)
+            return lambda *_a, **_k: (v, [])
+
+        edge = await call("chain_create", {"name": "edge", "target_score": 0.25})
+        eid = edge["chain_id"]
+
+        async def submit_with(score, **extra):
+            server.detector.__dict__["detect"] = stub(score)
+            try:
+                return await call("chain_submit", dict(
+                    {"chain_id": eid, "text": HUMAN, "span_feedback": False}, **extra))
+            finally:
+                server.detector.__dict__.pop("detect", None)
+
+        on_target = await submit_with(0.25)
+        assert on_target["ok"] and on_target["score"] == 0.25, on_target
+        assert on_target["target_met"] is True, (
+            "a score exactly ON the target must count as met -- the field is "
+            "documented as 'at or below'")
+        assert on_target["is_new_best"] is True
+        assert on_target["delta_vs_previous"] is None and on_target["delta_vs_best"] is None
+        assert on_target["best_score"] == 0.25
+        assert "target met" in on_target["next_action"].lower(), on_target["next_action"]
+
+        worse = await submit_with(0.4, note="regressed")
+        assert worse["step"] == 2 and worse["score"] == 0.4
+        assert worse["target_met"] is False
+        assert worse["is_new_best"] is False, "0.4 is not better than 0.25"
+        assert worse["best_score"] == 0.25, worse["best_score"]
+        assert worse["delta_vs_previous"] == 0.15, worse["delta_vs_previous"]
+        assert worse["delta_vs_best"] == 0.15, worse["delta_vs_best"]
+
+        better = await submit_with(0.1)
+        assert better["is_new_best"] is True and better["best_score"] == 0.1
+        assert better["delta_vs_previous"] == -0.3, better["delta_vs_previous"]
+        assert better["delta_vs_best"] == -0.15, better["delta_vs_best"]
+
+        server.detector.__dict__["detect"] = stub(0.25)
+        try:
+            asm_edge = await call("chain_assemble", {"chain_id": eid,
+                                                     "include_text": False})
+        finally:
+            server.detector.__dict__.pop("detect", None)
+        assert asm_edge["complete"] is True
+        assert asm_edge["score_met"] is True and asm_edge["target_met"] is True, (
+            "chain_assemble must treat a score exactly on the target as met")
+        assert [p["score"] for p in asm_edge["per_segment"]] == [0.1]
+        print("  scoring arithmetic: target boundary inclusive, deltas exact "
+              "(+0.150 / -0.300 vs previous, -0.150 vs best)")
 
         await call("chain_submit", {"chain_id": cid, "text": HUMAN, "segment": "b"})
         full = await call("chain_assemble", {"chain_id": cid, "include_text": False})
@@ -208,6 +399,55 @@ async def main() -> None:
             assert fragment in r["error"].lower(), (name, r["error"])
             assert "error_type" in r
         print(f"  error paths: {len(errors)} return ok=False dicts with error_type")
+
+        # ------------------------------------------------- tools never raise
+        # Those four exercise each tool's OWN try/except. The _guard decorator
+        # exists for everything else -- a CUDA OOM arrives as a bare RuntimeError
+        # and a broken Windows torch install as an OSError, neither of which the
+        # inner handlers catch. Nothing here provoked such an exception, so
+        # deleting _guard outright passed every suite. Provoke one per tool.
+        class Simulated(RuntimeError):
+            pass
+
+        def boom(*_a, **_k):
+            raise Simulated("simulated CUDA out of memory")
+
+        probes = [
+            ("detector_info", server.detector, "info", {}),
+            ("detector_unload", server.detector, "unload", {}),
+            ("detect", server.detector, "detect", {"text": HUMAN}),
+            ("detect_batch", server.detector, "detect_many", {"texts": [HUMAN]}),
+            ("detect_spans", server.detector, "detect_many", {"text": AI + " " + HUMAN}),
+            ("chain_create", server.store, "create", {"name": "x"}),
+            ("chain_submit", server.store, "get", {"chain_id": cid, "text": HUMAN}),
+            ("chain_status", server.store, "get", {"chain_id": cid}),
+            ("chain_history", server.store, "segments_of", {"chain_id": cid}),
+            ("chain_get_text", server.store, "get", {"chain_id": cid}),
+            ("chain_assemble", server.store, "get", {"chain_id": cid}),
+            ("chain_list", server.store, "list_chains", {}),
+            ("chain_delete", server.store, "delete", {"chain_id": cid}),
+        ]
+        for tool, owner, attr, args in probes:
+            had = attr in owner.__dict__
+            original = owner.__dict__.get(attr)
+            setattr(owner, attr, boom)
+            try:
+                # Must not raise out of the client: a raised tool becomes an
+                # opaque ToolError and the diagnosable message is lost.
+                r = await call(tool, args)
+            finally:
+                if had:
+                    setattr(owner, attr, original)
+                else:
+                    owner.__dict__.pop(attr, None)
+            assert isinstance(r, dict), f"{tool} returned {type(r).__name__}, not a dict"
+            assert r.get("ok") is False, f"{tool} hid an unexpected failure: {r}"
+            assert "simulated" in str(r.get("error", "")).lower(), (tool, r)
+            assert r.get("error_type") == "Simulated", (tool, r)
+        # And the server is still healthy afterwards.
+        assert (await call("chain_status", {"chain_id": cid}))["ok"] is True
+        print(f"  {len(probes)} tools turned an unexpected RuntimeError into an "
+              "ok=False dict instead of raising")
 
         # ---------------------------------------------------------------- unload
         u = await call("detector_unload")

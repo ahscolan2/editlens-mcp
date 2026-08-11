@@ -19,7 +19,7 @@ os.environ["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "branch.db")
 from fastmcp import Client  # noqa: E402
 
 from editlens_mcp import server  # noqa: E402
-from editlens_mcp.detector import text_fingerprint  # noqa: E402
+from editlens_mcp.detector import clean_text, text_fingerprint  # noqa: E402
 
 GOOD = ("I burnt the rice again. Third time this month. My flatmate calls it a tradition, "
         "which is generous of her considering she has to eat it. We had toast instead.")
@@ -66,12 +66,30 @@ async def main() -> None:
         # The earlier draft is still intact and still wins.
         best = await call("chain_get_text", {"chain_id": cid, "step": "best"})
         assert best["step"] in (1, 3), best["step"]
-        print(f"  best draft survives a bad revision: step {best['step']}")
+
+        # "best" means the LOWEST score, whatever the model happened to return.
+        # `best["step"] in (1, 3)` only encodes what these particular texts score;
+        # this encodes the feature. Reversing best_step's ORDER BY is caught here
+        # without depending on the detector agreeing with the test author.
+        scores = {h["step"]: h["score"] for h in hist["trajectory"]}
+        lowest = min(scores.values())
+        assert best["score"] == lowest, (best["score"], scores)
+        assert scores[best["step"]] == lowest, (best["step"], scores)
+        assert best["step"] == min(s for s, v in scores.items() if v == lowest), (
+            "ties must resolve to the earliest step")
+        # "latest" is a different question and must not collapse into "best".
+        latest = await call("chain_get_text", {"chain_id": cid, "step": "latest"})
+        assert latest["step"] == max(scores), (latest["step"], sorted(scores))
+        print(f"  best draft survives a bad revision: step {best['step']} "
+              f"(score {best['score']} = min of {sorted(scores.values())}), "
+              f"latest is step {latest['step']}")
 
         # --------------------------------------------------- offset staleness
         spans = await call("detect_spans", {"text": MESSY, "min_words": 1})
         fp = spans["source_fingerprint"]
         assert fp == text_fingerprint(MESSY)
+        # A help string, not a guarantee -- the behaviour it describes is asserted
+        # further down, where the fingerprint is shown to actually track the text.
         assert "stale" in spans["offsets_note"].lower()
 
         # Offsets must slice the ORIGINAL text, CRLF included.
@@ -82,10 +100,49 @@ async def main() -> None:
         print(f"  detect_spans: fingerprint={fp}, {len(spans['worst_units'])} spans align")
 
         # After an edit the fingerprint changes, so stale offsets are detectable.
+        # "sha256 of two different strings differs" is arithmetic, not a product
+        # guarantee. What has to hold is that the fingerprint tracks the exact
+        # string the offsets were computed against -- so first show the edit
+        # really did move them, then show the fingerprint saw it coming.
         edited = MESSY.replace("Alpha beta gamma delta.", "Alpha delta.")
+        moved = [u for u in spans["worst_units"]
+                 if edited[u["start"]:u["end"]].split() != u["text"].split()]
+        assert moved, ("this edit shifted no offsets, so it cannot demonstrate "
+                       "staleness -- choose an edit that does")
         again = await call("detect_spans", {"text": edited, "min_words": 1})
         assert again["source_fingerprint"] != fp, "edit must change the fingerprint"
-        print(f"  after edit: fingerprint {fp} -> {again['source_fingerprint']} (detectable)")
+        assert again["source_fingerprint"] == text_fingerprint(edited)
+        # Re-calling is the documented fix, so it must actually fix them.
+        for u in again["worst_units"]:
+            assert edited[u["start"]:u["end"]].split() == u["text"].split(), u
+        print(f"  after edit: {len(moved)} offsets moved, fingerprint {fp} -> "
+              f"{again['source_fingerprint']} (detectable), re-call realigns them")
+
+        # The fingerprint must cover the CALLER'S text, not the normalised copy.
+        # These two differ only in line endings, so the model sees exactly the
+        # same string -- but their offsets are different, and a caller holding
+        # one set must not be told the other set is current.
+        crlf = "Alpha beta gamma delta.\r\n\r\nEpsilon zeta eta theta. Iota kappa mu."
+        lf = crlf.replace("\r\n", "\n")
+        assert clean_text(crlf) == clean_text(lf), "these must normalise identically"
+        a = await call("detect_spans", {"text": crlf, "min_words": 1})
+        b = await call("detect_spans", {"text": lf, "min_words": 1})
+        offs_a = [(u["start"], u["end"]) for u in a["worst_units"]]
+        offs_b = [(u["start"], u["end"]) for u in b["worst_units"]]
+        assert offs_a != offs_b, ("these inputs were supposed to produce different "
+                                  f"offsets: {offs_a}")
+        assert a["source_fingerprint"] != b["source_fingerprint"], (
+            "two texts that normalise identically but carry different offsets share "
+            "a fingerprint -- it is being taken over the cleaned copy, so a caller "
+            "cannot tell whose coordinates it is holding")
+        # Stable for an unchanged input, and the same across tools.
+        repeat = await call("detect_spans", {"text": crlf, "min_words": 1})
+        assert repeat["source_fingerprint"] == a["source_fingerprint"]
+        det_fp = await call("detect", {"text": crlf, "include_windows": True})
+        if "source_fingerprint" in det_fp:
+            assert det_fp["source_fingerprint"] == a["source_fingerprint"]
+        print(f"  fingerprint distinguishes CRLF/LF twins that normalise the same: "
+              f"{a['source_fingerprint']} vs {b['source_fingerprint']}")
 
         sub = await call("chain_submit", {"chain_id": cid, "text": MESSY})
         assert sub["source_fingerprint"] == text_fingerprint(MESSY)

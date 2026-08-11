@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -66,11 +67,182 @@ def test_simultaneous_open_processes():
 
 
 def test_journal_mode_reported():
-    s = ChainStore(TMP / "mode.db")
-    assert s.journal_mode in {"wal", "delete", "truncate", "persist", "memory", "off"}, \
-        s.journal_mode
-    print(f"  journal_mode recorded: {s.journal_mode}")
+    """WAL, specifically -- not merely 'some valid journal mode'.
+
+    Accepting any of the six legal modes here meant a mutation that deleted the
+    WAL switch entirely still passed: `delete` is a valid mode. WAL is the whole
+    reason the switch exists (concurrent readers alongside one writer), so assert
+    it, and assert the connection is really in it rather than trusting the
+    attribute the store set on itself.
+    """
+    path = TMP / "mode.db"
+    s = ChainStore(path)
+    assert s.journal_mode == "wal", s.journal_mode
+    live = s._conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+    assert live == "wal", f"store reported {s.journal_mode!r} but connection is in {live!r}"
+    # A -wal sidecar appears only once the database really journals into one.
+    s.create("x")
+    assert Path(str(path) + "-wal").exists(), "no -wal sidecar: WAL is not actually on"
+    print("  journal_mode is WAL on the live connection, -wal sidecar present")
     s.close()
+
+
+def _hold_write_lock(path, hold_seconds, ready, released):
+    """Take a RESERVED lock on `path` for `hold_seconds`, then release it.
+
+    BEGIN IMMEDIATE is exactly what ChainStore._write() does, so this is a real
+    second client mid-write rather than an artificial lock.
+    """
+    conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None,
+                           timeout=30)
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS lockbait (x)")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO lockbait VALUES (1)")
+        ready.set()
+        time.sleep(hold_seconds)
+        conn.execute("COMMIT")
+    finally:
+        released.set()
+        conn.close()
+
+
+def test_wal_switch_retries_through_a_held_write_lock():
+    """Opening a store while another client holds a write lock must still work.
+
+    SQLite does NOT run the busy handler for a journal-mode change when another
+    connection holds a RESERVED lock: `PRAGMA journal_mode=WAL` fails instantly
+    with "database is locked", busy_timeout notwithstanding (verified: under
+    BEGIN IMMEDIATE it raises in ~0ms even with busy_timeout=30000). That is why
+    _set_wal retries by hand.
+
+    The old test only had twelve threads open a database at the same time and
+    hoped the race fired; it never did, so deleting the retry loop passed. This
+    forces the contention instead of hoping for it.
+    """
+    path = TMP / "wal_contended.db"
+    # A pre-existing NON-WAL database: journal_mode=WAL is a no-op once the file
+    # is already in WAL, so the switch must be a real one for this to bite.
+    seed = sqlite3.connect(str(path), isolation_level=None)
+    seed.execute("PRAGMA journal_mode=DELETE")
+    seed.execute("CREATE TABLE IF NOT EXISTS lockbait (x)")
+    seed.close()
+
+    hold = 1.0
+    ready, released = threading.Event(), threading.Event()
+    blocker = threading.Thread(
+        target=_hold_write_lock, args=(path, hold, ready, released), daemon=True)
+    blocker.start()
+    assert ready.wait(10), "could not acquire the blocking write lock"
+
+    t0 = time.monotonic()
+    store = ChainStore(path, timeout=10.0)   # must not raise "database is locked"
+    elapsed = time.monotonic() - t0
+
+    assert store.journal_mode == "wal", (
+        f"opened under contention but never reached WAL: {store.journal_mode!r}")
+    assert elapsed >= hold * 0.5, (
+        f"returned in {elapsed:.2f}s -- the lock was not actually held, so this "
+        "test proves nothing")
+    assert elapsed < 10.0, f"took {elapsed:.2f}s, longer than the store timeout"
+    # And it is a working store, not just a constructed one.
+    cid = store.create("after contention")["chain_id"]
+    store.add_step(cid, "main", "d", 0.5, 2, "x", 1, [0.25] * 4)
+    assert store.latest_step(cid, "main")["step_no"] == 1
+    store.close()
+    blocker.join(timeout=10)
+    print(f"  WAL switch retried through a {hold:.1f}s write lock, succeeded in "
+          f"{elapsed:.2f}s")
+
+
+class RecordingConn:
+    """Delegates to a real connection, recording the SQL it is asked to run."""
+
+    def __init__(self, real, log):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_log", log)
+
+    def execute(self, sql, *args):
+        self._log.append(sql)
+        return self._real.execute(sql, *args)
+
+    def executescript(self, sql):
+        self._log.append("<executescript>")
+        return self._real.executescript(sql)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+def test_busy_timeout_precedes_every_other_statement():
+    """busy_timeout must be armed BEFORE the journal-mode switch, not after.
+
+    It governs every statement issued after it, so setting it late leaves the
+    startup statements -- the ones two clients actually collide on -- running
+    with whatever default happens to be in force.
+    """
+    log: list[str] = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(*a, **kw):
+        return RecordingConn(real_connect(*a, **kw), log)
+
+    import editlens_mcp.chains as chains_mod
+    chains_mod.sqlite3.connect = recording_connect
+    try:
+        s = ChainStore(TMP / "order.db", timeout=12.0)
+    finally:
+        chains_mod.sqlite3.connect = real_connect
+
+    lowered = [q.lower() for q in log]
+    busy = next((i for i, q in enumerate(lowered) if "busy_timeout=" in q), None)
+    journal = next((i for i, q in enumerate(lowered) if "journal_mode=" in q), None)
+    assert busy is not None, f"busy_timeout was never set: {log}"
+    assert journal is not None, f"journal_mode was never set: {log}"
+    assert busy < journal, (
+        f"busy_timeout set at statement {busy}, after journal_mode at {journal}: {log}")
+    # And it is actually in force on the connection, at the configured value.
+    live = s._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert live == 12000, f"busy_timeout is {live}, expected 12000"
+    print(f"  busy_timeout armed at statement {busy}, journal_mode at {journal}; "
+          f"live value {live}ms")
+    s.close()
+
+
+def test_writes_wait_out_a_concurrent_writer():
+    """A write that collides with another client's transaction must block, not die.
+
+    This is what busy_timeout buys. Without it (on either the connect() call or
+    the PRAGMA) an ordinary chain_submit racing a second client fails outright
+    with "database is locked".
+    """
+    path = TMP / "write_contended.db"
+    store = ChainStore(path, timeout=15.0)
+    cid = store.create("busy")["chain_id"]
+
+    hold = 1.0
+    ready, released = threading.Event(), threading.Event()
+    blocker = threading.Thread(
+        target=_hold_write_lock, args=(path, hold, ready, released), daemon=True)
+    blocker.start()
+    assert ready.wait(10), "could not acquire the blocking write lock"
+
+    t0 = time.monotonic()
+    step = store.add_step(cid, "main", "written under contention", 0.5, 2, "x", 3,
+                          [0.25] * 4)
+    elapsed = time.monotonic() - t0
+
+    assert step == 1, step
+    assert elapsed >= hold * 0.5, (
+        f"add_step returned in {elapsed:.2f}s -- the lock was not really held")
+    assert store.latest_step(cid, "main")["text"] == "written under contention"
+    store.close()
+    blocker.join(timeout=10)
+    print(f"  add_step waited out a {hold:.1f}s foreign write lock ({elapsed:.2f}s) "
+          "instead of failing")
 
 
 class FailingConn:
@@ -386,6 +558,9 @@ def test_device_fallback_covers_placement_failure():
 if __name__ == "__main__":
     print("robustness tests")
     test_journal_mode_reported()
+    test_wal_switch_retries_through_a_held_write_lock()
+    test_busy_timeout_precedes_every_other_statement()
+    test_writes_wait_out_a_concurrent_writer()
     test_simultaneous_open_threads()
     test_simultaneous_open_processes()
     test_failed_commit_does_not_wedge_the_store()
