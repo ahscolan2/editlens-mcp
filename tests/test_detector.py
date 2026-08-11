@@ -8,7 +8,14 @@ TMP = Path(tempfile.mkdtemp())
 os.environ["EDITLENS_DB"] = str(TMP / "v.db")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from editlens_mcp.detector import EditLensDetector, count_words
+from editlens_mcp.detector import EditLensDetector, count_words, pick_device
+
+import torch  # noqa: E402
+
+# Never hardcode "cuda": on a Mac or a CPU-only box that aborts the whole suite,
+# and run_tests.py is the documented way to verify an install.
+DEVICE = os.environ.get("EDITLENS_DEVICE") or pick_device(torch)
+HAS_GPU = DEVICE in {"cuda", "mps"}
 
 TEXTS = [
     "In today's rapidly evolving landscape, stakeholders must leverage synergies to "
@@ -23,11 +30,31 @@ TEXTS = [
 ]
 
 
+def test_dtype_defaults():
+    """The default must be float32 -- the precision the checkpoint ships in."""
+    print("=== dtype resolution ===")
+    d = EditLensDetector(device=DEVICE)
+    assert d.info()["dtype"] == "float32", d.info()["dtype"]
+    if HAS_GPU:
+        assert EditLensDetector(device=DEVICE, dtype="float16").info()["dtype"] == "float16"
+    # float16 is GPU-only; on CPU the request must be downgraded, not honoured.
+    assert EditLensDetector(device="cpu", dtype="float16").info()["dtype"] == "float32"
+    # An unrecognised value falls back rather than crashing.
+    assert EditLensDetector(device=DEVICE, dtype="bfloat16").info()["dtype"] == "float32"
+    print("  default=float32, fp16 GPU-only, unknown values fall back")
+
+
 def test_precision():
     """Does the float16 option agree with the float32 default?"""
-    print("=== precision: float16 (opt-in) vs float32 (default) ===")
-    d16 = EditLensDetector(device="cuda", dtype="float16")
-    d32 = EditLensDetector(device="cuda", dtype="float32")
+    print("\n=== precision: float16 (opt-in) vs float32 (default) ===")
+    if not HAS_GPU:
+        print(f"  skipped: float16 needs a GPU (device={DEVICE})")
+        return 0.0
+    d16 = EditLensDetector(device=DEVICE, dtype="float16")
+    d32 = EditLensDetector(device=DEVICE, dtype="float32")
+    # Guards the mutation "always return float16", which made both detectors
+    # identical and the measured difference a meaningless 0.
+    assert d16.info()["dtype"] == "float16" and d32.info()["dtype"] == "float32"
     worst = 0.0
     for i, t in enumerate(TEXTS):
         s16 = d16.detect(t)[0].score
@@ -35,7 +62,9 @@ def test_precision():
         diff = abs(s16 - s32)
         worst = max(worst, diff)
         print(f"  text{i}: fp16={s16:.6f}  fp32={s32:.6f}  diff={diff:.6f}")
-    print(f"  --> max disagreement: {worst:.6f}")
+        assert diff < 0.01, f"fp16 disagrees with fp32 by {diff} on text{i}"
+    assert worst > 0.0, "fp16 and fp32 identical to the bit -- are both really loading?"
+    print(f"  --> max disagreement: {worst:.6f} (non-zero, under 0.01)")
     return worst
 
 
@@ -56,10 +85,24 @@ def test_long_text(det):
     print(f"  coverage: char 0..{covered} of {len(long_doc)}  seams ok")
     assert covered >= len(long_doc.strip()) - 5, "tail of document not scored"
 
+    # Owned ranges must PARTITION the document: overlaps split at the midpoint so
+    # seam text is weighted once. Without this, restoring the old double-counting
+    # passes every other assertion here.
+    assert windows[0]["owned_start"] == 0
+    for a, b in zip(windows, windows[1:]):
+        assert a["owned_end"] == b["owned_start"], (
+            f"owned ranges do not tile: {a['owned_end']} -> {b['owned_start']}")
+    weighted = sum(w["words"] for w in windows)
+    assert abs(weighted - v.word_count) <= max(3, 0.03 * v.word_count), (
+        f"window weights sum to {weighted} but document has {v.word_count} words "
+        "-- overlaps are being counted twice")
+    print(f"  owned ranges partition cleanly: weights {weighted} == doc {v.word_count}")
+
     huge = unit * 60
     v2, w2 = det.detect(huge)
     print(f"  {count_words(huge)} words -> {v2.truncated_windows} windows, score={v2.score:.4f}")
     assert 0.0 <= v2.score <= 1.0
+    assert abs(sum(w["words"] for w in w2) - v2.word_count) <= max(3, 0.03 * v2.word_count)
     return True
 
 
@@ -115,7 +158,9 @@ async def test_multisegment_and_restart():
     fresh.close()
     print(f"  after restart: {len(rows)} chain(s), body={seg['steps']} step(s), "
           f"intro text recovered={text[:24]!r}")
-    assert rows and seg["steps"] == 1 and text
+    assert rows and seg["steps"] == 1
+    # Not just truthy: the recovered draft must BE the draft that was submitted.
+    assert text.split() == TEXTS[0].split(), "recovered text does not match submission"
     return asm
 
 
@@ -127,8 +172,9 @@ def test_determinism(det):
 
 
 if __name__ == "__main__":
+    test_dtype_defaults()
     worst = test_precision()
-    det = EditLensDetector(device="cuda")
+    det = EditLensDetector(device=DEVICE)
     det.ensure_loaded()
     test_long_text(det)
     test_edges(det)

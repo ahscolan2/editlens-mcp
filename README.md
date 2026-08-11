@@ -280,6 +280,14 @@ actually do.
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.
 
+The suite is mutation-tested: nine deliberate bugs were introduced one at a time — dropping
+the score normalisation, skipping the last window, restoring double-counted overlaps,
+inverting `best_step`, storing empty drafts, ignoring missing segments, shifting the offset
+map, dropping the UNIQUE index, forcing float16 — and all nine were caught.
+
+On a machine without a GPU (or with `EDITLENS_DEVICE=cpu`), the GPU-memory suite skips itself
+and the float16 comparison is skipped; everything else runs.
+
 ---
 
 ## Licence

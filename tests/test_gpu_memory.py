@@ -1,5 +1,6 @@
 """Verify GPU memory is actually released on idle and on demand."""
 
+import os
 import sys
 import time
 import threading
@@ -7,18 +8,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from editlens_mcp.detector import EditLensDetector  # noqa: E402
+from editlens_mcp.detector import EditLensDetector, accelerator_of, pick_device  # noqa: E402
 import torch  # noqa: E402
 
 TXT = "In today's rapidly evolving landscape, stakeholders leverage synergies to drive outcomes."
 
 
+DEVICE = os.environ.get("EDITLENS_DEVICE") or pick_device(torch)
+ACCEL = accelerator_of(DEVICE)
+
+if ACCEL == "cpu":
+    print("gpu memory tests skipped: no GPU on this machine "
+          f"(device={DEVICE}). Idle-unload logic is GPU-specific.")
+    raise SystemExit(0)
+
+
 def mb():
-    return torch.cuda.memory_allocated() / 1024**2
+    if ACCEL == "cuda":
+        return torch.cuda.memory_allocated() / 1024**2
+    return torch.mps.current_allocated_memory() / 1024**2
+
+
+def empty_cache():
+    (torch.cuda if ACCEL == "cuda" else torch.mps).empty_cache()
 
 
 print("=== manual unload ===")
-d = EditLensDetector(device="cuda", idle_unload_seconds=0)  # watchdog off
+d = EditLensDetector(device=DEVICE, idle_unload_seconds=0)  # watchdog off
 print(f"  before first use: loaded={d.loaded}  vram={mb():.0f}MB")
 s1 = d.detect(TXT)[0].score
 after = mb()
@@ -37,7 +53,7 @@ assert s1 == s2, "score changed across unload/reload"
 d.unload()
 
 print("\n=== idle watchdog ===")
-w = EditLensDetector(device="cuda", idle_unload_seconds=3)
+w = EditLensDetector(device=DEVICE, idle_unload_seconds=3)
 w.detect(TXT)
 print(f"  loaded, vram={mb():.0f}MB, idle timeout 3s")
 deadline = time.time() + 25
@@ -51,7 +67,7 @@ assert mb() < 50, "watchdog did not free VRAM"
 assert w.info()["auto_unloads"] == 1, w.info()["auto_unloads"]
 
 print("\n=== watchdog must not unload mid-request ===")
-r = EditLensDetector(device="cuda", idle_unload_seconds=1)
+r = EditLensDetector(device=DEVICE, idle_unload_seconds=1)
 r.detect(TXT)
 errors = []
 long_doc = TXT * 200
