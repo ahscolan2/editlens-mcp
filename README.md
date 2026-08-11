@@ -59,6 +59,22 @@ First run downloads ~1.4 GB of weights into the Hugging Face cache, then reuses 
 python run_tests.py
 ```
 
+### Shortcut
+
+`setup.py` does steps 1, 2 and 4 for you, checks gated-model access, and prints the exact
+MCP client config for your machine — including the right interpreter path:
+
+```bash
+python setup.py
+```
+
+### Note for macOS
+
+Developed and verified on Windows with CUDA. The macOS path (Metal/MPS) is implemented and
+its fallback logic is tested, but has not been run on real Apple Silicon. If Metal
+misbehaves, `EDITLENS_DEVICE=cpu` always works — this model is small enough that CPU is
+usable. Please open an issue with `detector_info` output if you hit anything.
+
 ---
 
 ## Register with an MCP client
@@ -193,7 +209,11 @@ line of drafts.
 ## Notes
 
 - **Device selection** is automatic: CUDA → Apple Silicon (Metal/MPS) → CPU. Override with
-  `EDITLENS_DEVICE`.
+  `EDITLENS_DEVICE`. On load the chosen device runs one tiny forward pass to prove it works;
+  if that fails the server falls back to CPU rather than erroring on every later call, and
+  `detector_info.device_fallback` says what happened. On macOS,
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` is set before torch is imported so the few ops without a
+  Metal kernel run on CPU instead of killing the process.
 - **Precision** defaults to `float32`, the precision the checkpoint is published in.
   Measured on an RTX 2080, `float16` moves scores by at most 0.001 and saves nothing on a
   single paragraph (14 ms either way); it is ~2.5× faster on long documents and ~1.6× on

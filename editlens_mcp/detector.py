@@ -62,6 +62,11 @@ def warmup_imports() -> str | None:
     global _warmed, _warmup_error
     if _warmed:
         return _warmup_error
+    # Must be set before torch is imported. A handful of ops still have no Metal
+    # kernel; without this the process dies instead of quietly using the CPU for
+    # that one op.
+    if sys.platform == "darwin":
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     try:
         import torch  # noqa: F401, PLC0415
         from transformers import (  # noqa: F401, PLC0415
@@ -249,6 +254,7 @@ class EditLensDetector:
         self._inflight = 0
         self._watchdog: threading.Thread | None = None
         self._unloads = 0
+        self._device_fallback: str | None = None
 
         self.model = None
         self.tokenizer = None
@@ -319,6 +325,7 @@ class EditLensDetector:
             ),
             "platform": sys.platform,
             "accelerator": accelerator_of(device),
+            "device_fallback": self._device_fallback,
             "warmup_error": _warmup_error,
             "idle_unload_seconds": self.idle_unload_seconds,
             "idle_seconds": (
@@ -473,6 +480,25 @@ class EditLensDetector:
             )
         return "\n".join(lines)
 
+    def _validate_device(self, model, tokenizer, torch, device: str, dtype_name: str):
+        """Run one tiny forward pass; fall back to CPU if the accelerator fails."""
+        try:
+            probe = tokenizer("ok", return_tensors="pt").to(device)
+            with torch.no_grad():
+                model(**probe)
+            return model, device, dtype_name
+        except Exception as exc:  # noqa: BLE001
+            if accelerator_of(device) == "cpu":
+                raise
+            print(
+                f"[editlens] {device} failed its warm-up pass "
+                f"({type(exc).__name__}: {exc}); falling back to CPU.",
+                file=sys.stderr,
+            )
+            self._device_fallback = f"{device} -> cpu: {type(exc).__name__}"
+            # float16 on CPU is slow and poorly supported; go back to float32.
+            return model.to(device="cpu", dtype=torch.float32).eval(), "cpu", "float32"
+
     def _load(self) -> None:
         import torch  # noqa: PLC0415
         from transformers import AutoModelForSequenceClassification, AutoTokenizer  # noqa: PLC0415
@@ -522,6 +548,14 @@ class EditLensDetector:
         dtype_name = self._resolve_dtype_name(device)
         dtype = torch.float16 if dtype_name == "float16" else torch.float32
         model = model.to(device=device, dtype=dtype).eval()
+
+        # Prove the accelerator can actually run this model before serving. Metal
+        # in particular can accept .to("mps") and then fail on the first forward
+        # pass; discovering that here costs one tiny inference, whereas
+        # discovering it later turns every detect call into an error.
+        model, device, dtype_name = self._validate_device(
+            model, tokenizer, torch, device, dtype_name
+        )
 
         self.model = model
         self.tokenizer = tokenizer
