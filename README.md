@@ -302,11 +302,12 @@ Default database location:
 python run_tests.py
 ```
 
-Eight suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
+Nine suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
 including error paths; SQLite concurrency and cross-process step allocation; span-offset
-correctness; branching and offset staleness; precision, windowing, edge cases and
-determinism; GPU idle-unload and threading under load; and the real path — the server as a
-stdio subprocess, which is what MCP clients actually do.
+correctness; branching and offset staleness; failure modes (simultaneous cold starts, failed
+commits, disk-full error reporting, accelerator fallback); precision, windowing, edge cases
+and determinism; GPU idle-unload and threading under load; and the real path — the server as
+a stdio subprocess, which is what MCP clients actually do.
 
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.

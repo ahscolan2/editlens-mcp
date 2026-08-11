@@ -187,10 +187,13 @@ def clean_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
             c3.extend(c2[line_start : line_start + keep])
             r3.extend(r2[line_start : line_start + keep])
             if k < len(c2):
-                # The newline absorbs whatever trailing whitespace was dropped.
-                drop_end = r2[k - 1][1] if k > line_start + keep else r2[k][0]
+                # The newline absorbs whatever trailing whitespace was dropped,
+                # so the ranges stay contiguous. Start from the first DROPPED
+                # character, not the last -- the latter equals r2[k][0] and made
+                # the whole expression a no-op, leaving those chars unmapped.
+                drop_start = r2[line_start + keep][0] if k > line_start + keep else r2[k][0]
                 c3.append("\n")
-                r3.append((min(r2[k][0], drop_end), r2[k][1]))
+                r3.append((min(drop_start, r2[k][0]), r2[k][1]))
             line_start = k + 1
     s3 = "".join(c3)
 
@@ -277,6 +280,7 @@ class EditLensDetector:
         self._watchdog: threading.Thread | None = None
         self._unloads = 0
         self._device_fallback: str | None = None
+        self._warned_dtype = False
 
         self.model = None
         self.tokenizer = None
@@ -322,11 +326,15 @@ class EditLensDetector:
             return "float16" if accelerator_of(device) in {"cuda", "mps"} else "float32"
         if requested in {"float32", "fp32", "32"}:
             return "float32"
-        # Unrecognised value: fall back rather than crash, but say so once.
-        print(
-            f"[editlens] warning: unknown EDITLENS_DTYPE={requested!r}; using float32",
-            file=sys.stderr,
-        )
+        # Unrecognised value: fall back rather than crash. Once, genuinely --
+        # _resolve_dtype_name runs on every detector_info call, so an unguarded
+        # print here spams a line per call.
+        if not self._warned_dtype:
+            self._warned_dtype = True
+            print(
+                f"[editlens] warning: unknown EDITLENS_DTYPE={requested!r}; using float32",
+                file=sys.stderr,
+            )
         return "float32"
 
     def info(self) -> dict:
@@ -532,22 +540,30 @@ class EditLensDetector:
             )
         return "\n".join(lines)
 
-    def _validate_device(self, model, tokenizer, torch, device: str, dtype_name: str):
-        """Run one tiny forward pass; fall back to CPU if the accelerator fails."""
+    def _place_model(self, model, tokenizer, torch, device: str, dtype_name: str):
+        """Move the model to `device` and prove it can run, else fall back to CPU.
+
+        The move AND the probe are both inside the guard. Covering only the probe
+        missed the commoner failure: a torch build without MPS, or a bad device
+        string, raises on `.to(device)` itself, so the documented fallback never
+        ran and every later detect call errored.
+        """
+        dtype = torch.float16 if dtype_name == "float16" else torch.float32
         try:
+            placed = model.to(device=device, dtype=dtype).eval()
             probe = tokenizer("ok", return_tensors="pt").to(device)
             with torch.no_grad():
-                model(**probe)
-            return model, device, dtype_name
+                placed(**probe)
+            return placed, device, dtype_name
         except Exception as exc:  # noqa: BLE001
             if accelerator_of(device) == "cpu":
                 raise
             print(
-                f"[editlens] {device} failed its warm-up pass "
-                f"({type(exc).__name__}: {exc}); falling back to CPU.",
+                f"[editlens] {device} unusable ({type(exc).__name__}: {exc}); "
+                "falling back to CPU.",
                 file=sys.stderr,
             )
-            self._device_fallback = f"{device} -> cpu: {type(exc).__name__}"
+            self._device_fallback = f"{device} -> cpu: {type(exc).__name__}: {exc}"
             # float16 on CPU is slow and poorly supported; go back to float32.
             return model.to(device="cpu", dtype=torch.float32).eval(), "cpu", "float32"
 
@@ -597,22 +613,20 @@ class EditLensDetector:
         else:
             device = pick_device(torch)
 
-        dtype_name = self._resolve_dtype_name(device)
-        dtype = torch.float16 if dtype_name == "float16" else torch.float32
-        model = model.to(device=device, dtype=dtype).eval()
-
-        # Prove the accelerator can actually run this model before serving. Metal
-        # in particular can accept .to("mps") and then fail on the first forward
-        # pass; discovering that here costs one tiny inference, whereas
-        # discovering it later turns every detect call into an error.
-        model, device, dtype_name = self._validate_device(
-            model, tokenizer, torch, device, dtype_name
+        # Place AND prove the accelerator can run this model before serving.
+        # Discovering it here costs one tiny inference; discovering it later
+        # turns every detect call into an error.
+        model, device, dtype_name = self._place_model(
+            model, tokenizer, torch, device, self._resolve_dtype_name(device)
         )
 
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.dtype = str(dtype).replace("torch.", "")
+        # dtype_name AFTER placement: on a CPU fallback the requested float16 is
+        # downgraded to float32, and reporting the request rather than the
+        # reality is exactly the misreport this field exists to prevent.
+        self.dtype = dtype_name
         self.n_buckets = int(model.config.num_labels)
         self.bucket_names = BUCKET_NAMES.get(
             self.n_buckets, [f"bucket_{i}" for i in range(self.n_buckets)]
@@ -685,8 +699,13 @@ class EditLensDetector:
             start = c0 if i == 0 else max(c0, (spans[i - 1][1] + c0) // 2)
             end = c1 if i == len(spans) - 1 else min(c1, (c1 + spans[i + 1][0]) // 2)
             owned.append((start, max(start, end)))
-        # Guarantee full coverage even if a window is fully contained in another.
-        owned[0] = (spans[0][0], owned[0][1])
+        # Force a true partition. A window fully contained in its neighbour can
+        # otherwise produce both a gap and an overlap; chaining each start to the
+        # previous end makes the ranges tile whatever the inputs look like.
+        owned[0] = (spans[0][0], max(owned[0][1], spans[0][0]))
+        for i in range(1, len(owned)):
+            start = owned[i - 1][1]
+            owned[i] = (start, max(start, owned[i][1]))
         owned[-1] = (owned[-1][0], max(owned[-1][1], spans[-1][1], text_len))
         return owned
 

@@ -19,6 +19,7 @@ SUITES = [
     ("concurrency", [sys.executable, "-u", str(ROOT / "tests" / "test_concurrency.py")]),
     ("offsets", [sys.executable, "-u", str(ROOT / "tests" / "test_offsets.py")]),
     ("branching", [sys.executable, "-u", str(ROOT / "tests" / "test_branching.py")]),
+    ("robustness", [sys.executable, "-u", str(ROOT / "tests" / "test_robustness.py")]),
     ("detector", [sys.executable, "-u", str(ROOT / "tests" / "test_detector.py")]),
     ("gpu_memory", [sys.executable, "-u", str(ROOT / "tests" / "test_gpu_memory.py")]),
     ("client", [sys.executable, "-u", str(ROOT / "tests" / "test_client.py")]),

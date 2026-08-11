@@ -90,9 +90,11 @@ class ChainStore:
             str(self.path), check_same_thread=False, timeout=timeout, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
+        # busy_timeout FIRST: it governs every later statement. Setting it after
+        # journal_mode leaves the riskiest statement unprotected.
         self._conn.execute("PRAGMA busy_timeout=%d" % int(timeout * 1000))
+        self.journal_mode = self._set_wal(timeout)
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         # Databases written before branching support lack this column.
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(steps)")}
@@ -107,6 +109,33 @@ class ChainStore:
             # losing rows to a dedupe we never asked permission for.
             self.duplicate_steps_present = True
 
+    def _set_wal(self, timeout: float) -> str:
+        """Switch to WAL, retrying by hand.
+
+        SQLite does NOT run the busy handler for a journal-mode change, so
+        `busy_timeout` does not cover this statement. Two clients starting
+        together therefore raced and one died with "database is locked" -- at
+        module import, before the server could report anything, so the client
+        just saw a dead process. Retry, and accept a non-WAL mode rather than
+        refusing to start (some network filesystems reject WAL outright).
+        """
+        deadline = time.monotonic() + max(2.0, timeout)
+        delay = 0.02
+        last: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                row = self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                return (row[0] if row else "unknown").lower()
+            except sqlite3.OperationalError as exc:
+                last = exc
+                time.sleep(delay)
+                delay = min(delay * 2, 0.25)
+        try:
+            row = self._conn.execute("PRAGMA journal_mode").fetchone()
+            return (row[0] if row else "unknown").lower()
+        except sqlite3.Error:
+            return f"unknown ({type(last).__name__})" if last else "unknown"
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -118,10 +147,19 @@ class ChainStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
+                # COMMIT must be inside the try. Outside it, a failing COMMIT
+                # left the transaction open forever and every later write died
+                # with "cannot start a transaction within a transaction".
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    # SQLite auto-rolls back on disk-full and I/O errors, so
+                    # ROLLBACK then fails and would SHADOW the real cause --
+                    # reporting "cannot rollback" instead of "disk is full".
+                    pass
                 raise
-            self._conn.execute("COMMIT")
 
     def _read(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -281,9 +319,14 @@ class ChainStore:
                         "UPDATE chains SET updated_at = ? WHERE id = ?", (now, chain_id)
                     )
                 return step_no
-            except sqlite3.IntegrityError:
-                # Another process claimed this step number between our read and
-                # write. Re-read and retry rather than overwrite their draft.
+            except sqlite3.IntegrityError as exc:
+                # Only a UNIQUE collision is worth retrying: another process
+                # claimed this step number between our read and write, so
+                # re-read rather than overwrite their draft. A FOREIGN KEY or
+                # NOT NULL violation (e.g. the chain was deleted underneath us)
+                # will never succeed, and retrying just burns 100 ms first.
+                if "unique" not in str(exc).lower():
+                    raise
                 if attempts >= 5:
                     raise
                 time.sleep(0.01 * attempts)

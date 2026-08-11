@@ -16,7 +16,7 @@ from typing import Annotated, Any, Literal
 from fastmcp import FastMCP
 from pydantic import Field
 
-from .chains import DEFAULT_DB, ChainStore
+from .chains import ChainStore, default_db_path
 from .detector import (
     DetectorUnavailable,
     EditLensDetector,
@@ -47,7 +47,9 @@ detector = EditLensDetector(
     dtype=os.environ.get("EDITLENS_DTYPE") or None,
     idle_unload_seconds=float(os.environ.get("EDITLENS_IDLE_UNLOAD", "300")),
 )
-store = ChainStore(os.environ.get("EDITLENS_DB", DEFAULT_DB))
+# default_db_path() re-reads EDITLENS_DB and treats an empty value as unset.
+# Passing os.environ.get(...) here instead handed it "" and crashed at import.
+store = ChainStore(default_db_path())
 
 MAX_SPAN_REPORT = 5
 # Below this the model's score is indicative rather than precise.
