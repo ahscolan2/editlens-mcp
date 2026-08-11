@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -357,15 +358,25 @@ def test_owned_ranges_always_partition():
         [(0, 100, ""), (99, 100, "")],
     ]
     for spans in cases:
-        text_len = max(s[1] for s in spans)
-        owned = EditLensDetector._owned_ranges(spans, text_len)
-        assert len(owned) == len(spans)
-        for a, b in zip(owned, owned[1:]):
-            assert a[1] == b[0], f"gap/overlap in {owned} from {spans}"
-        for a, b in owned:
-            assert a <= b, f"inverted range {(a, b)} in {owned}"
-        assert owned[-1][1] >= text_len, (owned, text_len)
-    print(f"  {len(cases)} pathological window sets all partition cleanly")
+        last_span_end = max(s[1] for s in spans)
+        # The document is longer than the last window's char span whenever the
+        # tokeniser's final offset stops short of the end of the string. That
+        # tail still has to be weighted by SOMETHING, or those words vanish from
+        # the score entirely.
+        for text_len in (last_span_end, last_span_end + 13):
+            owned = EditLensDetector._owned_ranges(spans, text_len)
+            assert len(owned) == len(spans)
+            for a, b in zip(owned, owned[1:]):
+                assert a[1] == b[0], f"gap/overlap in {owned} from {spans}"
+            for a, b in owned:
+                assert a <= b, f"inverted range {(a, b)} in {owned}"
+            assert owned[0][0] == spans[0][0], (owned, spans)
+            assert owned[-1][1] >= text_len, (
+                f"last window owns up to {owned[-1][1]} but the text is "
+                f"{text_len} long: the tail is unweighted")
+            covered = sum(b - a for a, b in owned)
+            assert covered == owned[-1][1] - owned[0][0], (owned, covered)
+    print(f"  {len(cases)} pathological window sets partition cleanly, tail included")
 
 
 def _legacy_db(path: Path) -> str:
@@ -433,6 +444,200 @@ def test_concurrent_migration_of_a_legacy_db():
     assert s.history("ch_old", "main")[-1]["parent_step"] == 1
     s.close()
     print("  legacy rows preserved; parent_step usable after migration")
+
+
+class _ScriptedConn:
+    """A sqlite3 connection wrapper that scripts what happens around ALTER TABLE.
+
+    The 16-thread test above only reaches the migration race by luck: whether a
+    thread loses the ALTER and sees "duplicate column name" depends on the GIL,
+    and in practice it usually does not. Deleting the tolerance therefore passed
+    every suite. These hooks make each branch of _migrate() happen on purpose.
+    """
+
+    def __init__(self, conn, on_table_info=None, alter_failures=()):
+        object.__setattr__(self, "_c", conn)
+        object.__setattr__(self, "_on_table_info", on_table_info)
+        object.__setattr__(self, "_alter_failures", list(alter_failures))
+        object.__setattr__(self, "_alters", 0)
+
+    def execute(self, sql, *args):
+        if self._on_table_info is not None and "table_info(steps)" in sql:
+            rows = self._c.execute(sql, *args).fetchall()
+            hook = self._on_table_info
+            object.__setattr__(self, "_on_table_info", None)  # once only
+            hook()  # another client migrates between our read and our ALTER
+            return rows
+        if "ADD COLUMN parent_step" in sql:
+            object.__setattr__(self, "_alters", self._alters + 1)
+            if self._alter_failures:
+                raise sqlite3.OperationalError(self._alter_failures.pop(0))
+        return self._c.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._c, name, value)
+
+
+@contextmanager
+def _scripted_sqlite(**kw):
+    real = sqlite3.connect
+
+    def fake(*a, **k):
+        return _ScriptedConn(real(*a, **k), **kw)
+
+    sqlite3.connect = fake
+    try:
+        yield real
+    finally:
+        sqlite3.connect = real
+
+
+def test_migration_tolerates_a_lost_alter_race():
+    """Losing the ALTER race is success: the column exists either way.
+
+    Without the "duplicate column" tolerance the loser dies at module import and
+    the MCP client sees a process that exited, not an error.
+    """
+    path = Path(_legacy_db(TMP / "dupcol.db"))
+    real_connect = sqlite3.connect  # the hook must not re-enter the wrapper
+
+    def someone_else_migrates():
+        other = real_connect(str(path), isolation_level=None)
+        try:
+            other.execute("ALTER TABLE steps ADD COLUMN parent_step INTEGER")
+        finally:
+            other.close()
+
+    with _scripted_sqlite(on_table_info=someone_else_migrates):
+        store = ChainStore(path)  # must not raise "duplicate column name"
+
+    cols = [r["name"] for r in store._conn.execute("PRAGMA table_info(steps)")]
+    assert cols.count("parent_step") == 1, cols
+    assert store._conn._alters == 1, f"the losing ALTER never ran: {store._conn._alters}"
+    assert store.latest_step("ch_old", "main")["text"] == "legacy draft"
+    store.add_step("ch_old", "main", "after the race", 0.3, 1, "y", 3, [0.25] * 4,
+                   parent_step=1)
+    assert store.history("ch_old", "main")[-1]["parent_step"] == 1
+    store.close()
+    print("  lost ALTER race tolerated; legacy rows intact, parent_step usable")
+
+
+def test_migration_retries_a_locked_alter_and_still_gives_up():
+    """The retry loop: wait out a lock, re-raise anything else, honour the deadline."""
+    # 1. Two locked ALTERs in a row, then success.
+    path = Path(_legacy_db(TMP / "lockedalter.db"))
+    with _scripted_sqlite(alter_failures=["database is locked", "database table is busy"]):
+        store = ChainStore(path)
+    assert store._conn._alters == 3, (
+        f"migration did not retry the locked ALTER: {store._conn._alters} attempt(s)")
+    cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(steps)")}
+    assert "parent_step" in cols, cols
+    store.close()
+
+    # 2. An error that is NOT a lock must propagate, not be retried or swallowed.
+    path2 = Path(_legacy_db(TMP / "badalter.db"))
+    with _scripted_sqlite(alter_failures=["no such table: steps"]):
+        try:
+            ChainStore(path2)
+            raise AssertionError("a non-lock migration failure must not be swallowed")
+        except sqlite3.OperationalError as exc:
+            assert "no such table" in str(exc), exc
+
+    # 3. A lock that never clears must end at the deadline, not retry forever and
+    #    not give up instantly.
+    path3 = Path(_legacy_db(TMP / "stucklock.db"))
+    t0 = time.monotonic()
+    with _scripted_sqlite(alter_failures=["database is locked"] * 100000):
+        try:
+            ChainStore(path3, timeout=0.2)
+            raise AssertionError("expected the migration to give up eventually")
+        except sqlite3.OperationalError as exc:
+            assert "locked" in str(exc), exc
+    elapsed = time.monotonic() - t0
+    # Floor is max(2.0, timeout); giving up sooner means it never retried.
+    assert 1.5 <= elapsed < 30.0, f"gave up after {elapsed:.2f}s"
+    print(f"  locked ALTER retried to success; non-lock error propagated; "
+          f"stuck lock gave up after {elapsed:.1f}s")
+
+
+def test_legacy_duplicate_steps_are_flagged_not_deleted():
+    """A pre-UNIQUE database keeps its duplicates; the flag is how callers learn."""
+    path = Path(_legacy_db(TMP / "dupsteps.db"))
+    seed = sqlite3.connect(str(path), isolation_level=None)
+    seed.execute(
+        "INSERT INTO steps (chain_id, segment, step_no, text, score, bucket, label,"
+        " words, probs, note, created_at)"
+        " VALUES ('ch_old','main',1,'duplicate draft',0.4,1,'y',2,'[]',NULL,0)")
+    seed.close()
+
+    store = ChainStore(path)
+    assert store.duplicate_steps_present is True, (
+        "a legacy database with duplicate step numbers must report the flag")
+    rows = store._conn.execute(
+        "SELECT text FROM steps WHERE chain_id='ch_old' AND segment='main'"
+        " AND step_no=1").fetchall()
+    assert {r["text"] for r in rows} == {"legacy draft", "duplicate draft"}, rows
+    assert len(rows) == 2, f"duplicate rows were silently destroyed: {len(rows)} left"
+    # The index is absent, so it must not be reported as enforced.
+    idx = [r["name"] for r in store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")]
+    assert "idx_steps_unique" not in idx, idx
+    store.close()
+
+    clean = ChainStore(TMP / "clean_flag.db")
+    assert clean.duplicate_steps_present is False, (
+        "a fresh database must not claim duplicates")
+    clean_idx = [r["name"] for r in clean._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index'")]
+    assert "idx_steps_unique" in clean_idx, clean_idx
+    clean.close()
+    print("  legacy duplicates flagged and preserved; fresh DB clean and indexed")
+
+
+def test_non_positive_idle_unload_disables_the_watchdog():
+    """`EDITLENS_IDLE_UNLOAD=0` is documented as "never". A negative value is
+    the same instruction typed differently -- and must not instead start a
+    watchdog whose deadline is already in the past, which unloads the model
+    between every pair of calls."""
+    from editlens_mcp.detector import EditLensDetector
+
+    for seconds in (0, 0.0, -1, -300.0):
+        det = EditLensDetector(device="cpu", idle_unload_seconds=seconds)
+        det._start_watchdog()
+        assert det._watchdog is None, f"idle_unload={seconds!r} started a watchdog"
+
+    live = EditLensDetector(device="cpu", idle_unload_seconds=5)
+    live._start_watchdog()
+    assert live._watchdog is not None and live._watchdog.daemon, (
+        "a positive idle timeout must start a daemon watchdog")
+    first = live._watchdog
+    live._start_watchdog()
+    assert live._watchdog is first, "watchdog started twice"
+    print("  idle_unload <= 0 starts no watchdog; a positive one starts exactly one")
+
+
+def test_history_limit_returns_the_most_recent_steps():
+    """`limit` must trim the OLDEST steps, and the result stays chronological."""
+    store = ChainStore(TMP / "hist.db")
+    cid = store.create("h")["chain_id"]
+    for i in range(1, 8):
+        store.add_step(cid, "main", f"draft {i}", 0.9 - i * 0.05, 1, "x", 10, [0.25] * 4,
+                       note=f"n{i}")
+    assert len(store.history(cid, "main")) == 7
+
+    trimmed = store.history(cid, "main", limit=3)
+    steps = [r["step"] for r in trimmed]
+    assert steps == [5, 6, 7], f"limit=3 should keep the last three, got {steps}"
+    assert [r["note"] for r in trimmed] == ["n5", "n6", "n7"]
+    assert len(store.history(cid, "main", limit=1)) == 1
+    assert store.history(cid, "main", limit=1)[0]["step"] == 7
+    # A limit larger than the trajectory is not an error.
+    assert len(store.history(cid, "main", limit=200)) == 7
+    store.close()
+    print("  history(limit=N) keeps the N most recent steps, oldest-first")
 
 
 def test_failed_init_closes_the_connection():
@@ -570,6 +775,11 @@ if __name__ == "__main__":
     test_owned_ranges_always_partition()
     test_device_fallback_covers_placement_failure()
     test_concurrent_migration_of_a_legacy_db()
+    test_non_positive_idle_unload_disables_the_watchdog()
+    test_migration_tolerates_a_lost_alter_race()
+    test_migration_retries_a_locked_alter_and_still_gives_up()
+    test_legacy_duplicate_steps_are_flagged_not_deleted()
+    test_history_limit_returns_the_most_recent_steps()
     test_failed_init_closes_the_connection()
     test_info_reports_reality_after_unload()
     test_device_fallback_cleared_on_recovery()

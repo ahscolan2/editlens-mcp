@@ -1,7 +1,7 @@
 """Gap-closing verification: precision, long-text windowing, multi-segment
 chains, restart persistence, and edge cases."""
 
-import asyncio, os, sys, tempfile
+import asyncio, os, sys, tempfile, threading, time
 from pathlib import Path
 
 TMP = Path(tempfile.mkdtemp())
@@ -257,6 +257,79 @@ def test_determinism(det):
     assert len(set(a)) == 1, "scores must be reproducible"
 
 
+def test_load_records_where_the_model_actually_landed():
+    """A real load that falls back must be REMEMBERED, not re-predicted.
+
+    The model unloads after a few minutes idle, so unloaded is where
+    detector_info spends most of its life. Recomputing the device from the
+    request there reports one already proven unusable. The earlier test faked
+    `_last_device`; this one drives the real `_load`.
+    """
+    print("\n=== load records the real device ===")
+    det = EditLensDetector(device="cuda:99", idle_unload_seconds=0)
+    det.ensure_loaded()  # placement fails, falls back to CPU
+    assert det.loaded
+    assert det.device == "cpu" and det.dtype == "float32", (det.device, det.dtype)
+    assert det._last_device == "cpu" and det._last_dtype == "float32", (
+        f"_load did not record the landing device: "
+        f"{det._last_device}/{det._last_dtype}")
+
+    assert det.unload() is True
+    info = det.info()
+    assert info["device"] == "cpu", (
+        f"unloaded info re-predicted the request: {info['device']}")
+    assert info["dtype"] == "float32", info["dtype"]
+    assert info["accelerator"] == "cpu", info["accelerator"]
+    assert info["device_fallback"] and "cuda:99 -> cpu" in info["device_fallback"], (
+        info["device_fallback"])
+    assert info["vram_mb"] is None and info["loaded"] is False
+    print(f"  real load fell back to {info['device']}/{info['dtype']}; "
+          f"still reported after unload")
+
+
+def test_unload_waits_for_an_in_flight_request():
+    """A manual unload during traffic must not null the model mid-request.
+
+    Without `_infer_lock`, `detector_unload` (or a client calling it while
+    another is scoring) surfaces as `'NoneType' object is not callable` from
+    windows()/detect_many(), which reach self.tokenizer directly.
+    """
+    print("\n=== unload vs. an in-flight request ===")
+    det = EditLensDetector(device=DEVICE, idle_unload_seconds=0)
+    det.detect(TEXTS[0])
+    assert det.loaded
+
+    entered, release = threading.Event(), threading.Event()
+    real_score = det._score_batch
+
+    def slow(texts):
+        entered.set()
+        assert release.wait(30), "test deadlock"
+        return real_score(texts)
+
+    det._score_batch = slow
+    scored: list = []
+    worker = threading.Thread(target=lambda: scored.append(det.detect(TEXTS[0])[0].score))
+    worker.start()
+    assert entered.wait(30), "request never reached the model"
+
+    unloaded: list = []
+    unloader = threading.Thread(target=lambda: unloaded.append(det.unload()))
+    unloader.start()
+    time.sleep(0.3)
+    assert not unloaded, "unload() completed while a request was in flight"
+    assert det.loaded and det.model is not None and det.tokenizer is not None, (
+        "the model was dropped underneath a running request")
+
+    release.set()
+    worker.join(60)
+    unloader.join(60)
+    assert scored and isinstance(scored[0], float), scored
+    assert unloaded == [True], unloaded
+    assert not det.loaded
+    print("  unload waited for the in-flight request, then freed the model")
+
+
 if __name__ == "__main__":
     test_dtype_defaults()
     worst = test_precision()
@@ -267,5 +340,7 @@ if __name__ == "__main__":
     test_batch_agrees_with_single(det)
     test_edges(det)
     test_determinism(det)
+    test_unload_waits_for_an_in_flight_request()
+    test_load_records_where_the_model_actually_landed()
     asyncio.run(test_multisegment_and_restart())
     print(f"\nALL CHECKS PASSED (max fp16/fp32 disagreement {worst:.6f})")

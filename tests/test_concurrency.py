@@ -135,7 +135,23 @@ def test_delete_isolated_from_insert():
     assert store.delete(drop) == 5
     remaining = store._read("SELECT COUNT(*) AS n FROM steps WHERE chain_id = ?", (keep,))
     assert remaining[0]["n"] == 5, "unrelated chain lost rows"
-    print("  delete removed only its own 5 rows")
+    # The count is a report, not the deletion: assert the rows are actually gone,
+    # or a delete that removes nothing still returns 5 and passes.
+    gone = store._read("SELECT COUNT(*) AS n FROM steps WHERE chain_id = ?", (drop,))
+    assert gone[0]["n"] == 0, f"{gone[0]['n']} orphaned steps survived the delete"
+    assert store._read("SELECT 1 FROM chains WHERE id = ?", (drop,)) == []
+    try:
+        store.get(drop)
+        raise AssertionError("deleted chain is still readable")
+    except KeyError:
+        pass
+    # Deleting it again is an error, not a silent success.
+    try:
+        store.delete(drop)
+        raise AssertionError("deleting a missing chain should raise")
+    except KeyError:
+        pass
+    print("  delete removed only its own 5 rows, and removed them")
     store.close()
 
 

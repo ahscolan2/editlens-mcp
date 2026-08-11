@@ -138,11 +138,24 @@ Thirteen tools. Every one returns a JSON object; failures come back as
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `detect` | `text`, `include_windows=false` | Score one text. Returns `score`, `bucket`, `label`, `probs`, `word_count`, `windows`. |
+| `detect` | `text`, `include_windows=false` | Score one text. Returns `score`, `bucket`, `label`, `probs`, `word_count`, `char_count`, `windows` (a *count*), `target_hint`. |
 | `detect_batch` | `texts` | Score N texts in one forward pass. Returns `results`, `best_index`, `best_score`, `mean_score`. |
-| `detect_spans` | `text`, `granularity="sentence"`, `top=10`, `min_words=25` | Split and score each unit, worst-first. |
-| `detector_info` | — | Checkpoint, platform, accelerator, device, dtype, load state, VRAM, token visibility. |
-| `detector_unload` | — | Release GPU memory now. |
+| `detect_spans` | `text`, `granularity="sentence"` (`"sentence"`\|`"paragraph"`), `top=10` (1–50), `min_words=25` (1–200) | Split and score each unit, worst-first. |
+| `detector_info` | — | Checkpoint, base model, `platform`, `accelerator`, `device`, `dtype`, load state, VRAM, idle counters, token visibility, plus `db_path` and `duplicate_steps_present`. |
+| `detector_unload` | — | Release GPU memory now. Returns `was_loaded`. |
+
+`detect(include_windows=true)` adds `window_detail` — but only when the text actually
+needed more than one window; a short text returns none. Each entry carries `start`/`end`
+(the window's own char span) and `owned_start`/`owned_end` (the sub-range that window was
+weighted by, after overlaps are split at their midpoint), all four in your original
+coordinates, plus `words`, `score`, `label` and a short `preview`.
+
+`detector_info.device_fallback` is `null` unless the chosen accelerator failed its load-time
+probe, in which case it says what happened. `cpu_backend` reports `{blas, threads}`.
+`duplicate_steps_present` is `true` only for a legacy database written before the UNIQUE
+step index existed and that still holds duplicate step numbers; the store leaves that data
+alone rather than deduplicating it, and says so here. `warmup_error` is non-null if the
+startup torch/transformers import failed.
 
 **Span offsets index the text you passed in.** `detect_spans`, `chain_submit`, and
 `detect(include_windows=true)` return `start`/`end` in your original coordinates, so you can
@@ -150,17 +163,28 @@ splice a rewrite straight back. The `text` field on each unit is the *normalised
 model scored (whitespace collapsed), which may differ from that exact slice.
 
 **Offsets go stale the moment you edit.** Rewrite one sentence and every later offset shifts.
-Each response carries a `source_fingerprint` — a digest of the exact string the offsets were
-computed from. Check it before reusing offsets you cached; if it does not match your current
-text, they have moved. For repeated rewrite cycles, matching on each unit's `text` is more
+Any response that carries offsets also carries a `source_fingerprint` — a digest of the exact
+string the offsets were computed from. `detect_spans` always returns one; `chain_submit`
+returns one whenever `span_feedback=true`; `detect` returns one only alongside
+`window_detail`. Check it before reusing offsets you cached; if it does not match your current
+text, they have moved. `detect_spans` also returns `offsets_note`, which says the same thing
+in the response itself. For repeated rewrite cycles, matching on each unit's `text` is more
 robust than splicing by index.
 
-`detect_spans` merges short sentences toward `min_words` because the model is unreliable on
-very short inputs. If that would leave the whole text as one unit, the threshold is relaxed
-automatically — `min_words_used` reports what it settled on and `granularity_relaxed` says
-whether it backed off. Each unit carries `reliable` (≥25 words), and `unreliable_units`
-counts the rest. With `granularity="paragraph"`, paragraphs are returned as authored and
-`min_words_used` is `null`, because no threshold was applied.
+`detect_spans` returns `document_score`, `document_label`, `unit_count`, `worst_units` (the
+`top` highest-scoring units), `source_fingerprint`, `offsets_note`, `min_words_used`,
+`granularity_relaxed` and `unreliable_units`.
+
+It merges short sentences toward `min_words` because the model is unreliable on very short
+inputs. If that would leave the whole text as one unit, the threshold is relaxed
+automatically — it retries at 15, then 8, then 1 (skipping any that is not smaller than the
+`min_words` you asked for), stopping at the first that yields two or more units. If none of
+them divides the text, the original `min_words` is reported and nothing was relaxed.
+`min_words_used` reports what it settled on and `granularity_relaxed` says
+whether it backed off. Each unit carries `reliable`, which is a fixed **≥25 words** and does
+*not* track `min_words`; `unreliable_units` counts the rest. With
+`granularity="paragraph"`, paragraphs are returned as authored, `min_words_used` is `null`
+and `granularity_relaxed` is always `false`, because no threshold was applied.
 
 ### Chains
 
@@ -171,24 +195,28 @@ numbered **steps** (revisions).
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `chain_create` | `name`, `target_score=0.25`, `goal=null`, `segments=null` | Open a chain. Duplicate segment names are de-duplicated. |
+| `chain_create` | `name`, `target_score=0.25` (0.0–1.0), `goal=null`, `segments=null` | Open a chain. Duplicate segment names are de-duplicated. |
 | `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. |
 | `chain_status` | `chain_id` | Per-segment best/latest scores and what is still pending. |
-| `chain_history` | `chain_id`, `segment="main"`, `limit=30` | Score trajectory. Numbers and notes only. |
+| `chain_history` | `chain_id`, `segment="main"`, `limit=30` (1–200) | Score trajectory. Numbers and notes only. `limit` keeps the most recent N steps; they come back oldest-first, with `returned` counting them. An unknown `segment` is an error, not an empty trajectory. |
 | `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve a stored draft — `"best"`, `"latest"`, or a step number. |
 | `chain_assemble` | `chain_id`, `separator="\n\n"`, `include_text=true` | Join the best of every segment and score the whole document. |
-| `chain_list` | `limit=25` | List chains, most recently updated first. |
+| `chain_list` | `limit=25` (1–200) | List chains, most recently updated first. |
 | `chain_delete` | `chain_id` | Delete a chain and all its steps. Irreversible. |
 
-`chain_submit` returns `score`, `label`, `words`, `target_met`, `best_score`, `best_step`,
-`is_new_best`, `delta_vs_previous`, `delta_vs_best`, `next_action`, `worst_spans`, and
-`spans_above_target`. If span analysis fails, `span_error` carries the reason rather than
-silently reporting no spans to fix.
+`chain_submit` returns `step`, `parent_step`, `score`, `label`, `words`, `target_score`,
+`target_met`, `best_score`, `best_step`, `is_new_best`, `delta_vs_previous`, `delta_vs_best`,
+`next_action`, and — when `span_feedback=true` — `worst_spans`, `spans_above_target` and
+`source_fingerprint`. `delta_vs_previous` and `delta_vs_best` are `null` on the first step of
+a segment. If span analysis fails, `span_error` carries the reason rather than silently
+reporting no spans to fix, and `next_action` says so. Submitting to a segment the chain does
+not yet declare adds it, but only after the draft scores: a failed submit never registers the
+segment.
 
-**Rewrite only the spans marked `above_target`.** `worst_spans` is a ranking, not a
-to-do list — its tail is routinely text the same response labels `Human-written`, and
-rewriting that is how a loop makes a draft worse while believing it is following orders.
-When `spans_above_target` is 0 and the document is still above target, span-level work has
+**Rewrite only the spans marked `above_target`.** `worst_spans` is a ranking, not a to-do
+list — its tail is routinely text the same response labels `Human-written`, and rewriting
+that is how a loop makes a draft worse while believing it is following orders. When
+`spans_above_target` is 0 and the document is still above target, span-level work has
 bottomed out and `next_action` says so instead of sending you round again.
 
 `chain_status` returns `pending` (everything not at target) and splits it into `unstarted`
@@ -196,10 +224,12 @@ and `above_target`, which need opposite responses. `latest_is_best` per segment 
 `segments_with_better_earlier_draft` at the top — tell you whether the draft you last
 submitted is the one assembly will actually use.
 
-`chain_assemble` returns `document_score`, `per_segment`, `missing_segments`, `complete`,
-`score_met`, `target_met`, and `segments_above_target`. **`target_met` requires `complete`** —
-a document missing a declared section is not finished, however well the parts that exist
-happen to score.
+`chain_assemble` returns `document_score`, `document_label`, `words`, `windows`,
+`per_segment`, `missing_segments`, `complete`, `score_met`, `target_met`,
+`segments_above_target`, a `warning` when segments are missing, and `text` unless
+`include_text=false`. **`target_met` requires `complete`** — a document missing a declared
+section is not finished, however well the parts that exist happen to score; `score_met` is
+the score test alone.
 
 Every chain tool returns `next_action`. It is the field to read first: it accounts for the
 regression case, the bottomed-out case, and the status/assemble disagreement, none of which
@@ -272,9 +302,12 @@ line of drafts.
   Measured on an RTX 2080, `float16` moves scores by at most 0.001 and saves nothing on a
   single paragraph (14 ms either way); it is ~2.5× faster on long documents and ~1.6× on
   batches. Set `EDITLENS_DTYPE=float16` if you run big batches. float16 requires a GPU.
-- **GPU memory is released when idle.** Nothing loads until the first `detect` (0 MB until
-  then). After 5 minutes without a call the model unloads and returns ~1.4 GB; the next call
-  reloads in ~2 s. Tune with `EDITLENS_IDLE_UNLOAD` (`0` disables), or call `detector_unload`.
+- **GPU memory is released when idle.** Nothing loads until the first `detect`
+  (`detector_info.vram_mb` is `null` until then). After 5 minutes without a call the model
+  unloads and returns ~1.4 GB; the next call reloads in ~2 s. The watchdog checks on a tick of
+  `idle/4`, clamped to 5–30 s, so the unload can land up to half a minute past the deadline,
+  and it never interrupts a request in flight. `auto_unloads` counts how many times it has
+  fired. Tune with `EDITLENS_IDLE_UNLOAD` (`0` or negative disables), or call `detector_unload`.
 - **Startup imports torch on the main thread**, costing ~2 s. This is deliberate: MCP servers
   run tool functions in worker threads, and importing torch from a worker thread hangs
   indefinitely on Windows — the client times out and the server looks dead. Do not make these
@@ -297,25 +330,44 @@ line of drafts.
 
 ## Configuration
 
-| Env var | Default |
-| --- | --- |
-| `EDITLENS_CHECKPOINT` | `pangram/editlens_roberta-large` |
-| `EDITLENS_BASE_MODEL` | `FacebookAI/roberta-large` (tokenizer fallback) |
-| `EDITLENS_DEVICE` | auto: `cuda` → `mps` → `cpu` |
-| `EDITLENS_DTYPE` | `float32`. Set `float16` for speed on long/batched work (GPU only). |
-| `EDITLENS_BATCH_SIZE` | `8` |
-| `EDITLENS_IDLE_UNLOAD` | `300` seconds idle before GPU memory is released (`0` = never) |
-| `EDITLENS_TRANSPORT` | `stdio` |
-| `EDITLENS_DB` | see below |
-| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | falls back to the `hf auth login` cache |
+| Env var | Default | Empty value |
+| --- | --- | --- |
+| `EDITLENS_CHECKPOINT` | `pangram/editlens_roberta-large` | **used as-is** — an empty value is an empty repo id and the load fails |
+| `EDITLENS_BASE_MODEL` | `FacebookAI/roberta-large` (tokenizer fallback) | **used as-is**, same caveat |
+| `EDITLENS_DEVICE` | auto: `cuda` → `mps` → `cpu` | treated as unset |
+| `EDITLENS_DTYPE` | `float32`. Set `float16` for speed on long/batched work (GPU only). | treated as unset |
+| `EDITLENS_BATCH_SIZE` | `8` | treated as unset |
+| `EDITLENS_IDLE_UNLOAD` | `300` seconds idle before GPU memory is released (`0` or negative = never) | treated as unset |
+| `EDITLENS_TRANSPORT` | `stdio` | treated as unset |
+| `EDITLENS_DB` | see below | treated as unset |
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | falls back to the `hf auth login` cache | treated as unset (falls through to the other, then the cache) |
 
-Default database location:
+**Empty is not a configuration error.** MCP client configs routinely emit `"EDITLENS_DTYPE": ""`
+for a field the user left blank, and a server that dies at import over that just looks dead to
+the client. So every variable above except the two model ids treats `""` exactly as if it were
+unset. Whitespace-only is a narrower story: `EDITLENS_BATCH_SIZE` and `EDITLENS_IDLE_UNLOAD`
+also ignore `"   "`, but the others do not — `EDITLENS_DEVICE="   "` is a device name, and
+`EDITLENS_DB="   "` is a path.
+
+`EDITLENS_BATCH_SIZE` and `EDITLENS_IDLE_UNLOAD` also survive garbage: a non-numeric value
+prints one warning to stderr and falls back to the default rather than raising at import. A
+batch size below 1 is clamped up to 1; a negative idle-unload disables the watchdog.
+An unrecognised `EDITLENS_DTYPE` warns once and uses `float32`. A wrong-but-non-empty
+`EDITLENS_TRANSPORT` still errors, but the message quotes what was set.
+
+Default database location (used only when `EDITLENS_DB` is unset or empty):
 
 | Platform | Path |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\editlens-mcp\chains.db` |
+| Windows | `%LOCALAPPDATA%\editlens-mcp\chains.db` (or `~\AppData\Local\...` if that is unset) |
 | macOS | `~/Library/Application Support/editlens-mcp/chains.db` |
 | Linux | `$XDG_DATA_HOME/editlens-mcp/chains.db` (or `~/.local/share/...`) |
+
+The store opens in WAL mode where the filesystem allows it, and falls back to whatever
+journal mode it can get rather than refusing to start — some network filesystems reject WAL.
+`run_tests.py` points `EDITLENS_DB` at a fresh temp path before any suite runs — unless you
+set one yourself, which it leaves alone — so no suite can fall through to the default and run
+schema migrations against the operator's real database.
 
 ---
 
@@ -325,12 +377,21 @@ Default database location:
 python run_tests.py
 ```
 
-Ten suites: plumbing plus one real scoring pass; all 13 tools over an in-memory client
-including error paths; SQLite concurrency and cross-process step allocation; span-offset
-correctness; branching and offset staleness; failure modes (simultaneous cold starts, failed
-commits, disk-full error reporting, accelerator fallback); entry points and startup config;
-precision, windowing, edge cases and determinism; GPU idle-unload and threading under load;
-and the real path — the server as a stdio subprocess, which is what MCP clients actually do.
+Eleven suites, in the order `run_tests.py` runs them:
+
+| Suite | Covers |
+| --- | --- |
+| `smoke_test.py` | plumbing and tool wiring against a stubbed model, plus one real scoring pass |
+| `tests/test_tools.py` | all 13 tools over an in-memory client, including error paths |
+| `tests/test_usability.py` | the guidance a model actually follows: `next_action` in the bottomed-out, regression and status-vs-assemble cases |
+| `tests/test_concurrency.py` | SQLite concurrency and cross-process step allocation |
+| `tests/test_offsets.py` | span offsets index the caller's original text |
+| `tests/test_branching.py` | `branch_from`/`parent_step` and offset staleness |
+| `tests/test_robustness.py` | failure modes: simultaneous cold starts, failed commits, disk-full reporting, accelerator fallback |
+| `tests/test_entrypoints.py` | startup configuration, the helper scripts, and test-database isolation |
+| `tests/test_detector.py` | precision, windowing, multi-segment chains, restart persistence, edge cases, determinism |
+| `tests/test_gpu_memory.py` | idle unload, manual unload, threading under load |
+| `tests/test_client.py` | the real path — the server as a stdio subprocess, which is what MCP clients actually do |
 
 `run_tests.py` forces `EDITLENS_DB` to a temp path before any suite runs, so testing can
 never migrate or write your real chain database.
@@ -338,13 +399,23 @@ never migrate or write your real chain database.
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.
 
-The suite is mutation-tested: deliberate bugs are introduced one at a time and the suite must
-fail. Over 30 have been tried — dropping the score normalisation, skipping the last window,
-restoring double-counted overlaps, inverting `best_step`, storing empty drafts, ignoring
-missing segments, truncating CRLF spans, dropping the UNIQUE index, forcing float16, removing
-the WAL retry, scoring by argmax instead of expectation, deleting the `_guard` decorator —
-and every one is now caught. Several were not, until the tests were strengthened to catch
-them; a test that cannot fail is worse than no test.
+The suite is mutation-tested: deliberate bugs are introduced one at a time, in a copy of the
+tree, and the suite has to fail. The first round covered the scoring core — dropping the score
+normalisation, skipping the last window, restoring double-counted overlaps, inverting
+`best_step`, storing empty drafts, ignoring missing segments, shifting the offset map, dropping
+the UNIQUE index, forcing float16. Later rounds pushed into the startup and recovery paths:
+the migration retry loop and its "duplicate column" tolerance, the `duplicate_steps_present`
+legacy flag, `chain_history`'s `limit`, paragraph splitting and its offsets,
+`split_units_adaptive`'s "no threshold applied" report, `map_span`'s empty/inverted/overrun
+guards, the last window's ownership of the document tail, `_load` recording where the model
+actually landed, a manual unload racing a request, a non-positive `EDITLENS_IDLE_UNLOAD`, and
+the `EDITLENS_DB` floor in `run_tests.py`. Every survivor was closed by strengthening an
+assertion, never by weakening one.
+
+Two mutations survive on purpose, because they are equivalent rather than uncaught: the
+watchdog's `_inflight == 0` check (unreachable while `_infer_lock` is held for whole requests)
+and the explicit `DELETE FROM steps` in `chain_delete` (the `ON DELETE CASCADE` already does
+it; break both and the suite fails).
 
 On a machine without a GPU (or with `EDITLENS_DEVICE=cpu`), the GPU-memory suite skips itself
 and the float16 comparison is skipped; everything else runs.
