@@ -35,21 +35,28 @@ TEXT = ("I burnt the rice again. Third time this month. My flatmate calls it a "
 BUCKETS = ["Human-written", "Lightly AI-edited", "Heavily AI-edited", "Fully AI-generated"]
 
 
-def _verdict(score: float) -> Verdict:
+def _verdict(score: float, words: int = 30) -> Verdict:
     nb = len(BUCKETS)
     idx = int(round(score * (nb - 1)))
     return Verdict(score=score, bucket=idx, label=BUCKETS[idx],
-                   probs=[1.0 / nb] * nb, word_count=30, char_count=160)
+                   probs=[1.0 / nb] * nb, word_count=words, char_count=160)
 
 
 class _Stub:
-    """Force the document score, and optionally the per-span scores."""
+    """Force the document score, and optionally the per-span scores.
 
-    def __init__(self, doc: float, spans: list[float] | None = None):
-        self.doc, self.spans = doc, spans
+    `words` sets the word count of the DOCUMENT verdict only; span verdicts keep
+    the default. Length drives the short-text guidance, so a case about that
+    guidance has to be able to set it without also changing every span.
+    """
+
+    def __init__(self, doc: float, spans: list[float] | None = None, words: int = 30):
+        self.doc, self.spans, self.words = doc, spans, words
 
     def __enter__(self):
-        server.detector.__dict__["detect"] = lambda *_a, **_k: (_verdict(self.doc), [])
+        server.detector.__dict__["detect"] = (
+            lambda *_a, **_k: (_verdict(self.doc, self.words), [])
+        )
         if self.spans is not None:
             it = list(self.spans)
             server.detector.__dict__["detect_many"] = (
@@ -60,6 +67,16 @@ class _Stub:
     def __exit__(self, *_exc):
         server.detector.__dict__.pop("detect", None)
         server.detector.__dict__.pop("detect_many", None)
+
+
+# Twenty-four sentences of ~17 words. At the default 25-word merge threshold
+# they pair up into 12 units -- more than any default span window can show --
+# and at min_words=1 they stay as 24, so the same fixture exercises both the
+# truncation cases and the granularity knob.
+TWELVE_UNITS = " ".join(
+    f"Sentence number {i} carries on for a little while and clears about fifteen "
+    f"words entirely on its own here." for i in range(24)
+)
 
 
 async def main() -> None:
@@ -263,6 +280,180 @@ async def main() -> None:
         assert "branch_from" in instr and "chain_get_text" in instr, instr
         assert "not comparable across lengths" in instr, instr
         print("  server instructions name next_action, the scale caveat, and recovery")
+
+        # ------------------------------------------------------------------
+        # 9. `worst_spans` holds at most `span_top` entries, but next_action
+        #    described everything NOT in it as "already at or below target".
+        #    Measured live on a 1548-word document: 36 units, all 36 above a
+        #    0.25 target, 5 reported -- so 31 failing units were called
+        #    acceptable, every round, while the caller believed it had done the
+        #    work the tool asked for.
+        # ------------------------------------------------------------------
+        tid = (await call("chain_create", {"name": "trunc", "target_score": 0.25}))["chain_id"]
+        with _Stub(0.9, spans=[0.9]):
+            t = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS})
+        assert t["span_unit_count"] == 12, t["span_unit_count"]
+        assert t["spans_above_target_total"] == 12, t
+        assert t["spans_above_target"] == len(t["worst_spans"]) == 5, t
+        assert t["spans_truncated"] is True, t
+        na = t["next_action"]
+        # The exact false claim. It must not survive anywhere in the response.
+        assert "already at or below target" not in na, na
+        assert "12 units above target" in na and "other 7 are NOT shown" in na, na
+        assert "span_top" in na and "span_min_words" in na, na
+        print(f"  truncated spans: {t['spans_above_target']} shown of "
+              f"{t['spans_above_target_total']} above target in {t['span_unit_count']} "
+              f"units -- next_action says so instead of calling the other 7 fine")
+
+        # A window that happens to hide only SOME failing units is the same bug.
+        with _Stub(0.9, spans=[0.9, 0.1]):
+            half = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS})
+        assert half["spans_above_target_total"] == 6 and half["spans_above_target"] == 5, half
+        assert half["spans_truncated"] is True, half
+        assert "already at or below target" not in half["next_action"], half["next_action"]
+
+        # ...and when nothing is hidden, the count of units to leave alone must
+        # come from the whole draft, not from the reported slice.
+        with _Stub(0.9, spans=[0.9, 0.1]):
+            full = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS,
+                                               "span_top": 12})
+        assert full["spans_truncated"] is False, full
+        assert full["spans_above_target"] == full["spans_above_target_total"] == 6, full
+        assert "Leave the other 6 unit(s) alone" in full["next_action"], full["next_action"]
+        print("  untruncated: 'leave the other 6 alone' counts all 12 units, not the 5 shown")
+
+        # ------------------------------------------------------------------
+        # 10. When every unit is above target there is no "rest" to leave alone,
+        #     and saying so sends the caller hunting for a safe passage that
+        #     does not exist. Live: a 94-word paragraph, 3 units, all 3 above.
+        # ------------------------------------------------------------------
+        with _Stub(0.9, spans=[0.9]):
+            allbad = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS,
+                                                 "span_top": 12})
+        assert allbad["spans_above_target"] == allbad["span_unit_count"] == 12, allbad
+        assert allbad["spans_truncated"] is False, allbad
+        na = allbad["next_action"]
+        assert "nothing here to preserve" in na, na
+        assert "already at or below target" not in na and "Leave the other" not in na, na
+        print("  all 12 units above target: told to rewrite the passage, not to keep part of it")
+
+        # ------------------------------------------------------------------
+        # 11. span_top and span_min_words have to reach the splitter. Measured:
+        #     driving a 1548-word document to target rewrote 56% of it at the
+        #     default min_words=25 over 4 rounds, and 15% over 2 rounds at 15,
+        #     because a span is the quantum of rewriting -- so the knob that
+        #     sets span size is the one that decides how much of the author's
+        #     text a revision loop destroys. detect_spans had it; this did not.
+        # ------------------------------------------------------------------
+        with _Stub(0.9, spans=[0.9]):
+            coarse = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS})
+            fine = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS,
+                                               "span_min_words": 1, "span_top": 50})
+        assert coarse["span_min_words_used"] == 25, coarse
+        assert fine["span_min_words_used"] == 1, fine
+        assert fine["span_unit_count"] > coarse["span_unit_count"], (
+            "span_min_words did not reach the splitter",
+            fine["span_unit_count"], coarse["span_unit_count"])
+        assert len(fine["worst_spans"]) > len(coarse["worst_spans"]), (
+            "span_top did not widen the reported window",
+            len(fine["worst_spans"]), len(coarse["worst_spans"]))
+        assert max(s["words"] for s in fine["worst_spans"]) <= \
+            max(s["words"] for s in coarse["worst_spans"]), (
+            "finer spans must not be larger -- that is the whole point")
+        print(f"  span_min_words 25 -> {coarse['span_unit_count']} units, "
+              f"1 -> {fine['span_unit_count']} units; span_top widened "
+              f"{len(coarse['worst_spans'])} -> {len(fine['worst_spans'])}")
+
+        # ------------------------------------------------------------------
+        # 12. EditLens false-positives on short informal human writing -- that
+        #     is the model. What the server did with it was the defect: a
+        #     genuinely human 26-word note scored 0.4579 and the only advice
+        #     was "rewrite the span above target", with nothing anywhere saying
+        #     the number was noise. Measured on five known-human passages cut
+        #     to length, the score spread across them was 0.63 at 15 words and
+        #     0.06 by 60, and one crossed a 0.25 target on length alone.
+        # ------------------------------------------------------------------
+        wid = (await call("chain_create", {"name": "wee", "target_score": 0.25}))["chain_id"]
+        with _Stub(0.46, spans=[0.9, 0.1], words=26):
+            tiny = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
+        assert tiny["reliable"] is True, "26 words clears the per-unit floor of 25"
+        assert "reliability_note" in tiny and "26 words" in tiny["reliability_note"], tiny
+        na = tiny["next_action"]
+        assert na.startswith("CAUTION:"), na
+        assert "chain_assemble" in na, na
+        # The caution leads; the ordinary advice still follows it.
+        assert "above_target=true" in na, na
+        print(f"  26-word draft over target: next_action leads with the caution, "
+              f"not with 'rewrite it'")
+
+        # Below the per-unit floor the wording is stronger still.
+        with _Stub(0.46, spans=[0.9, 0.1], words=12):
+            tinier = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
+        assert tinier["reliable"] is False, tinier
+        assert "not a measurement" in tinier["reliability_note"], tinier["reliability_note"]
+
+        # A long draft must NOT be nagged, or the caution stops carrying weight.
+        with _Stub(0.46, spans=[0.9, 0.1], words=600):
+            big = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
+        assert big["reliable"] is True and "reliability_note" not in big, big
+        assert not big["next_action"].startswith("CAUTION:"), big["next_action"]
+
+        # Nor a short draft that already MET target -- there is nothing to warn
+        # off doing, and "stop" is not advice that needs a caveat.
+        with _Stub(0.05, spans=[0.05], words=26):
+            ok_small = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
+        assert not ok_small["next_action"].startswith("CAUTION:"), ok_small["next_action"]
+        print("  the caution fires only on short drafts that are still above target")
+
+        # `detect` reported a bare 4-decimal score for any length at all.
+        with _Stub(0.46, words=26):
+            d = await call("detect", {"text": TWELVE_UNITS})
+        assert d["reliable"] is True and "26 words" in d["reliability_note"], d
+        with _Stub(0.46, words=600):
+            d2 = await call("detect", {"text": TWELVE_UNITS})
+        assert d2["reliable"] is True and "reliability_note" not in d2, d2
+        print("  detect carries the same length caveat detect_spans always had")
+
+        # ------------------------------------------------------------------
+        # 13. The README sells chains that run for hundreds of steps. At 65
+        #     steps chain_history(limit=30) returned steps 36..65 and called it
+        #     the trajectory; the best draft was step 4 and nothing said so.
+        #     Scanning the returned trajectory for its lowest score -- the
+        #     obvious move, and the one branch_from needs an answer for --
+        #     silently picks the best of the last thirty.
+        # ------------------------------------------------------------------
+        lid = (await call("chain_create", {"name": "long", "target_score": 0.01}))["chain_id"]
+        with _Stub(0.30, spans=[0.30]):
+            await call("chain_submit", {"chain_id": lid, "text": TEXT, "note": "the good one"})
+        with _Stub(0.80, spans=[0.80]):
+            for i in range(44):
+                await call("chain_submit", {"chain_id": lid, "text": TEXT, "note": f"pass {i}"})
+
+        window = await call("chain_history", {"chain_id": lid, "limit": 10})
+        assert window["total_steps"] == 45 and window["returned"] == 10, window
+        assert window["truncated"] is True, window
+        assert window["best_step"] == 1 and window["best_score"] == 0.3, window
+        assert all(r["step"] > 1 for r in window["trajectory"]), "step 1 is outside this window"
+        # The best score in the window is worse than the segment's actual best:
+        # exactly the trap, so the response has to name the way out.
+        assert min(r["score"] for r in window["trajectory"]) > window["best_score"], window
+        assert "note" in window and "branch_from=1" in window["note"], window
+        assert "chain_get_text" in window["note"], window["note"]
+        print(f"  chain_history(limit=10) of 45: truncated=True, best_step=1 named "
+              f"even though the window starts at {window['trajectory'][0]['step']}")
+
+        whole = await call("chain_history", {"chain_id": lid, "limit": 200})
+        assert whole["returned"] == whole["total_steps"] == 45, whole
+        assert whole["truncated"] is False and "note" not in whole, whole
+        print("  a window that contains the best step carries no such note")
+
+        # An untouched segment must not claim a best step it does not have.
+        eid = (await call("chain_create", {
+            "name": "empty", "target_score": 0.25, "segments": ["solo"]}))["chain_id"]
+        blank = await call("chain_history", {"chain_id": eid, "segment": "solo"})
+        assert blank["total_steps"] == 0 and blank["truncated"] is False, blank
+        assert blank["best_step"] is None and "note" not in blank, blank
+        print("  an empty segment reports total_steps=0 and no best step")
 
     print("USABILITY TESTS PASSED")
 

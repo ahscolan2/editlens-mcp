@@ -138,7 +138,7 @@ Thirteen tools. Every one returns a JSON object; failures come back as
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `detect` | `text`, `include_windows=false` | Score one text. Returns `score`, `bucket`, `label`, `probs`, `word_count`, `char_count`, `windows` (a *count*), `target_hint`. |
+| `detect` | `text`, `include_windows=false` | Score one text. Returns `score`, `bucket`, `label`, `probs`, `word_count`, `char_count`, `windows` (a *count*), `target_hint`, `reliable`, and `reliability_note` under 60 words. |
 | `detect_batch` | `texts` | Score N texts in one forward pass. Returns `results`, `best_index`, `best_score`, `mean_score`. |
 | `detect_spans` | `text`, `granularity="sentence"` (`"sentence"`\|`"paragraph"`), `top=10` (1–50), `min_words=25` (1–200) | Split and score each unit, worst-first. |
 | `detector_info` | — | Checkpoint, base model, `platform`, `accelerator`, `device`, `dtype`, load state, VRAM, idle counters, token visibility, plus `db_path` and `duplicate_steps_present`. |
@@ -196,9 +196,9 @@ numbered **steps** (revisions).
 | Tool | Parameters | What it does |
 | --- | --- | --- |
 | `chain_create` | `name`, `target_score=0.25` (0.0–1.0), `goal=null`, `segments=null` | Open a chain. Duplicate segment names are de-duplicated. |
-| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. |
+| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `span_top=5` (1–50), `span_min_words=25` (1–200), `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. |
 | `chain_status` | `chain_id` | Per-segment best/latest scores and what is still pending. |
-| `chain_history` | `chain_id`, `segment="main"`, `limit=30` (1–200) | Score trajectory. Numbers and notes only. `limit` keeps the most recent N steps; they come back oldest-first, with `returned` counting them. An unknown `segment` is an error, not an empty trajectory. |
+| `chain_history` | `chain_id`, `segment="main"`, `limit=30` (1–200) | Score trajectory. Numbers and notes only. `limit` keeps the most recent N steps; they come back oldest-first, with `returned` counting them. `total_steps`, `truncated`, `best_step` and `best_score` describe the whole segment, so a window never hides the best draft. An unknown `segment` is an error, not an empty trajectory. |
 | `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve a stored draft — `"best"`, `"latest"`, or a step number. |
 | `chain_assemble` | `chain_id`, `separator="\n\n"`, `include_text=true` | Join the best of every segment and score the whole document. |
 | `chain_list` | `limit=25` (1–200) | List chains, most recently updated first. |
@@ -206,18 +206,39 @@ numbered **steps** (revisions).
 
 `chain_submit` returns `step`, `parent_step`, `score`, `label`, `words`, `target_score`,
 `target_met`, `best_score`, `best_step`, `is_new_best`, `delta_vs_previous`, `delta_vs_best`,
-`next_action`, and — when `span_feedback=true` — `worst_spans`, `spans_above_target` and
-`source_fingerprint`. `delta_vs_previous` and `delta_vs_best` are `null` on the first step of
-a segment. If span analysis fails, `span_error` carries the reason rather than silently
-reporting no spans to fix, and `next_action` says so. Submitting to a segment the chain does
-not yet declare adds it, but only after the draft scores: a failed submit never registers the
-segment.
+`reliable`, `next_action`, and — when `span_feedback=true` — `worst_spans`,
+`spans_above_target`, `span_unit_count`, `spans_above_target_total`, `spans_truncated`,
+`span_min_words_used` and `source_fingerprint`. `delta_vs_previous` and `delta_vs_best` are
+`null` on the first step of a segment. If span analysis fails, `span_error` carries the
+reason rather than silently reporting no spans to fix, and `next_action` says so. Submitting
+to a segment the chain does not yet declare adds it, but only after the draft scores: a
+failed submit never registers the segment.
 
 **Rewrite only the spans marked `above_target`.** `worst_spans` is a ranking, not a to-do
 list — its tail is routinely text the same response labels `Human-written`, and rewriting
 that is how a loop makes a draft worse while believing it is following orders. When
 `spans_above_target` is 0 and the document is still above target, span-level work has
 bottomed out and `next_action` says so instead of sending you round again.
+
+**`worst_spans` is a window, not the list.** It holds at most `span_top` entries.
+`spans_above_target` counts the ones shown; `spans_above_target_total` counts every unit
+above target in the draft, and `spans_truncated` says whether those differ. On a 1548-word
+document all 36 units scored above a 0.25 target and five were reported — so treat the
+unshown remainder as unexamined, not as passing.
+
+**On long drafts, tune `span_min_words`.** A span is the quantum of rewriting: acting on one
+means replacing all of it. Driving that same 1548-word document to target rewrote 56% of it
+over 4 rounds at the default 25, and 15% over 2 rounds at `span_min_words=15`; on a 584-word
+document it was 35% versus 18%. Smaller spans score more noisily — each span carries
+`reliable`, false below 25 words — but they let you replace the sentences that score badly
+instead of the paragraphs around them. `span_min_words_used` reports what the splitter
+settled on, which can be lower than you asked for if the draft would not otherwise divide.
+
+**Short drafts get a caveat instead of a rewrite order.** `detect` and `chain_submit` return
+`reliable` (≥25 words) and, under 60 words, a `reliability_note`; below 60 and still above
+target, `next_action` leads with it. Five known-human passages cut to a fixed length scored
+across a 0.63 range at 15 words, 0.24 at 30 and 0.06 by 60, and one crossed a 0.25 target on
+length alone — so a short draft scoring high is not evidence that it needs rewriting.
 
 `chain_status` returns `pending` (everything not at target) and splits it into `unstarted`
 and `above_target`, which need opposite responses. `latest_is_best` per segment — and
@@ -283,6 +304,20 @@ chain_history(ch)                                  → [(1,None), (2,1), … (6,
 ancestor are distinguishable from a straight line of revisions. `chain_get_text(step="best")`
 and `chain_assemble` always use the lowest-scoring draft regardless of branch, so a bad
 detour never costs you the good one.
+
+**What "hundreds of steps" actually costs.** Measured over 65 real submits on one segment:
+the `chain_submit` response stayed flat at ~1.8 KB (first 1830 bytes, last 1835, largest
+1836) and each call took ~40 ms, because the response never carries history — only this
+step, its deltas, and the spans. `chain_status` stayed under 1 KB at 65 steps. Nothing
+accumulates in your context.
+
+`chain_history` is the one response that grows with the chain, so it is capped: `limit`
+keeps the most recent N steps and defaults to 30. On a long chain that window can exclude
+the best draft entirely — at 65 steps the default returns steps 36–65, and the best was step
+4. So do **not** take the lowest score in `trajectory` for the best draft. `total_steps` and
+`truncated` say whether you are looking at a window, `best_step`/`best_score` describe the
+whole segment either way, and when the best step falls outside the window a `note` names it
+along with `chain_get_text` and `branch_from`.
 
 To widen rather than deepen: generate several candidates per step and use `detect_batch` to
 keep the best before submitting. That converges in fewer chain steps than revising a single
@@ -383,7 +418,7 @@ Eleven suites, in the order `run_tests.py` runs them:
 | --- | --- |
 | `smoke_test.py` | plumbing and tool wiring against a stubbed model, plus one real scoring pass |
 | `tests/test_tools.py` | all 13 tools over an in-memory client, including error paths |
-| `tests/test_usability.py` | the guidance a model actually follows: `next_action` in the bottomed-out, regression and status-vs-assemble cases |
+| `tests/test_usability.py` | the guidance a model actually follows: `next_action` in the bottomed-out, regression, status-vs-assemble, truncated-span, short-draft and long-history cases |
 | `tests/test_concurrency.py` | SQLite concurrency and cross-process step allocation |
 | `tests/test_offsets.py` | span offsets index the caller's original text |
 | `tests/test_branching.py` | `branch_from`/`parent_step` and offset staleness |

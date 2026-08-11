@@ -86,8 +86,17 @@ detector = EditLensDetector(
 store = ChainStore(default_db_path())
 
 MAX_SPAN_REPORT = 5
+# Merge threshold for span feedback, matching detect_spans' own default.
+SPAN_MIN_WORDS = 25
 # Below this the model's score is indicative rather than precise.
 RELIABLE_WORDS = 25
+# ...and below this it is still noisy enough to be worth a second opinion.
+# Measured by cutting five known-human passages to fixed lengths and scoring
+# each prefix: the spread across those five texts was 0.30 at 10 words, 0.63 at
+# 15, 0.37 at 20, then 0.24 at 30, 0.19 at 40, 0.12 at 50 and 0.06 by 60. One of
+# the five crossed a 0.25 target on nothing but length. So a score on a short
+# draft is not evidence that the draft needs rewriting.
+NOISY_WORDS = 60
 # How much worse than the best draft counts as a regression worth recovering
 # from, rather than run-to-run noise.
 REGRESSION_DELTA = 0.05
@@ -103,6 +112,29 @@ SCALE_NOTE = (
     "Scores are not comparable across lengths: the model scores short fragments "
     "harder than the same words inside a full document."
 )
+
+
+def _short_text_note(words: int) -> str | None:
+    """The caveat that belongs on any score computed from very little text.
+
+    Genuinely human passages cut to 15 words scored anywhere from 0.06 to 0.69
+    on this model. A caller handed 0.46 for a 26-word note, with no indication
+    of that spread, rewrites prose that was never the problem.
+    """
+    if words >= NOISY_WORDS:
+        return None
+    if words < RELIABLE_WORDS:
+        return (
+            f"Only {words} words: below ~{RELIABLE_WORDS} this score is indicative, not a "
+            f"measurement -- known-human passages this short have scored anywhere from "
+            f"0.02 to 0.69. Do not rewrite prose to move it. Score the text in its full "
+            f"context instead."
+        )
+    return (
+        f"Only {words} words: under ~{NOISY_WORDS} this score is noisy (human passages of "
+        f"this length vary by ~0.2 on nothing but length). Prefer the score of the whole "
+        f"document over this one."
+    )
 
 
 def _fail(exc: Exception) -> dict:
@@ -135,8 +167,9 @@ def _worst_spans(
     granularity: str = "sentence",
     top: int = MAX_SPAN_REPORT,
     target: float | None = None,
-) -> list[dict]:
-    """Score sentence-groups and return the highest-scoring ones.
+    min_words: int = SPAN_MIN_WORDS,
+) -> tuple[list[dict], dict]:
+    """Score sentence-groups and return the highest-scoring ones, plus totals.
 
     `start`/`end` index the caller's ORIGINAL text, not the normalised copy the
     model sees -- offsets you cannot splice against are worse than no offsets.
@@ -146,11 +179,19 @@ def _worst_spans(
     five -- including ones the same response labels Human-written, which is how
     a revision loop makes a draft worse while believing it is following
     instructions.
+
+    The second return value describes the WHOLE text, not the `top` slice of it.
+    Reporting only the slice is how a caller ends up being told that 31 units it
+    never saw are "already at or below target": on a 1548-word document all 36
+    units scored above a 0.25 target, and the response named 5.
     """
     source, imap = clean_text_with_map(text)
-    units, _ = split_units_adaptive(source, granularity=granularity)
+    units, used = split_units_adaptive(
+        source, granularity=granularity, min_words=min_words
+    )
+    meta = {"unit_count": len(units), "above_target_total": 0, "min_words_used": used}
     if len(units) < 2:
-        return []
+        return [], meta
     verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
     rows = []
     for (a, b), v in zip(units, verdicts):
@@ -161,13 +202,18 @@ def _worst_spans(
             "score": round(v.score, 4),
             "label": v.label,
             "words": v.word_count,
+            # The same per-unit caveat detect_spans already carries. A 9-word
+            # unit scored 0.99 is not the same evidence as a 40-word one.
+            "reliable": v.word_count >= RELIABLE_WORDS,
             "text": source[a:b],
         }
         if target is not None:
             row["above_target"] = v.score > target
         rows.append(row)
     rows.sort(key=lambda r: r["score"], reverse=True)
-    return rows[:top]
+    if target is not None:
+        meta["above_target_total"] = sum(1 for r in rows if r["above_target"])
+    return rows[:top], meta
 
 
 # --------------------------------------------------------------------- detector
@@ -232,6 +278,14 @@ def detect(
         return _fail(exc)
     out: dict[str, Any] = {"ok": True, **verdict.as_dict()}
     out["target_hint"] = "lower is more human-like"
+    # detect_spans has flagged short units as unreliable since it was written;
+    # `detect` reported a bare 4-decimal score for a 26-word input and said
+    # nothing. That is the number a caller acts on, so it is the one that most
+    # needs the caveat.
+    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
+    note = _short_text_note(verdict.word_count)
+    if note:
+        out["reliability_note"] = note
     if include_windows and len(windows) > 1:
         # Window offsets, like span offsets, must index the caller's own text.
         for w in windows:
@@ -403,6 +457,18 @@ def chain_submit(
     span_feedback: Annotated[
         bool, Field(description="Include the worst-scoring sentences in the response.")
     ] = True,
+    span_top: Annotated[
+        int,
+        Field(description="How many worst-scoring spans to return. Raise it on long "
+                          "drafts, where the default shows a small window of the units "
+                          "that are actually above target.", ge=1, le=50),
+    ] = MAX_SPAN_REPORT,
+    span_min_words: Annotated[
+        int,
+        Field(description="Merge sentences until a span reaches this many words. Lower "
+                          "it for smaller, more precisely targeted spans; raise it for "
+                          "steadier per-span scores.", ge=1, le=200),
+    ] = SPAN_MIN_WORDS,
     branch_from: Annotated[
         int | None,
         Field(description="Step number this draft was derived from. Use to fork an "
@@ -415,12 +481,22 @@ def chain_submit(
     and best steps, target status, and the worst spans. The draft text itself is
     kept on disk, not echoed back, so you can iterate indefinitely.
 
-    Read `next_action` first; it accounts for the three cases that are easy to
-    get wrong. Rewrite only spans marked `above_target` -- the list is worst-first,
-    not a to-do list, and the tail of it is usually text that is already fine.
-    History is append-only, so a draft that scores worse costs you nothing:
-    `best_step` names the best draft, `chain_get_text` retrieves it and
+    Read `next_action` first; it accounts for the cases that are easy to get
+    wrong. Rewrite only spans marked `above_target` -- the list is worst-first,
+    not a to-do list, and its tail is often text that is already fine. But check
+    `spans_truncated`: `worst_spans` holds at most `span_top` entries, and
+    `spans_above_target_total` counts every unit above target, including the ones
+    not shown. History is append-only, so a draft that scores worse costs you
+    nothing: `best_step` names the best draft, `chain_get_text` retrieves it and
     `branch_from` continues from it.
+
+    On a draft of more than a few hundred words, tune `span_min_words`. It sets
+    how much text each span covers, which is how much text you have to rewrite to
+    act on one. Driving a 1548-word document to a 0.25 target took 4 rounds and
+    rewrote 56% of it at the default 25; at `span_min_words=15` the same loop
+    took 2 rounds and rewrote 15%. Smaller spans score more noisily -- `reliable`
+    is false below ~25 words -- but they let you replace the sentences that
+    actually score badly instead of the paragraphs containing them.
 
     Span scores and the document score are not on one scale -- short fragments
     score higher than the same words in a full document -- so the spans can all
@@ -497,11 +573,20 @@ def chain_submit(
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
         "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
     }
+    # The score itself carries a caveat when there is barely any text to score.
+    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
+    short_note = _short_text_note(verdict.word_count)
+    if short_note:
+        out["reliability_note"] = short_note
+
     spans: list[dict] = []
+    span_meta = {"unit_count": 0, "above_target_total": 0, "min_words_used": span_min_words}
     span_status = "skipped"  # skipped | ok | too_short | failed
     if span_feedback:
         try:
-            spans = _worst_spans(text, target=target)
+            spans, span_meta = _worst_spans(
+                text, target=target, top=span_top, min_words=span_min_words
+            )
             span_status = "ok" if spans else "too_short"
         except Exception as exc:  # noqa: BLE001 - never lose the draft over feedback
             span_status = "failed"
@@ -509,7 +594,16 @@ def chain_submit(
             # which is the opposite of what a CUDA OOM or a load failure means.
             out["span_error"] = f"{type(exc).__name__}: {exc}"
         out["worst_spans"] = spans
+        # Count among the spans actually RETURNED -- next_action says "the N
+        # span(s) below", and that phrase has to match the list beneath it.
         out["spans_above_target"] = sum(1 for s in spans if s.get("above_target"))
+        # ...and the counts for the whole draft, which is what decides how much
+        # work is left. Without these the caller cannot tell a list of 5 spans
+        # that IS the whole text from a list of 5 that is a window onto 36.
+        out["span_unit_count"] = span_meta["unit_count"]
+        out["spans_above_target_total"] = span_meta["above_target_total"]
+        out["spans_truncated"] = span_meta["above_target_total"] > out["spans_above_target"]
+        out["span_min_words_used"] = span_meta["min_words_used"]
         out["source_fingerprint"] = text_fingerprint(text)
 
     # A draft that lost ground against the best one is the case where "keep
@@ -548,11 +642,37 @@ def chain_submit(
             f"try reordering, cutting the opening or closing sentence, varying sentence "
             f"length, or rewriting the passage from scratch. Then call chain_submit again."
         )
-    elif span_status == "ok":
+    elif span_status == "ok" and out["spans_truncated"]:
+        # "Leave the rest alone -- they are already at or below target" was a
+        # flat falsehood here. On a 1548-word draft every one of 36 units scored
+        # above target and the response named 5, so that sentence described 31
+        # failing units as acceptable. A caller acting on it under-fixes the
+        # document on every round and is told it has finished the job each time.
+        hidden = out["spans_above_target_total"] - out["spans_above_target"]
         out["next_action"] = (
             f"Rewrite the {out['spans_above_target']} span(s) below marked above_target=true "
-            f"in your own voice, then call chain_submit again. Leave the rest alone -- they "
-            f"are already at or below target."
+            f"in your own voice, then call chain_submit again. These are the worst of "
+            f"{out['spans_above_target_total']} units above target out of "
+            f"{out['span_unit_count']} in this draft -- the other {hidden} are NOT shown and "
+            f"are NOT fine. Raise span_top to see more of them per round, or lower "
+            f"span_min_words for smaller spans, so each rewrite replaces less text."
+        )
+    elif span_status == "ok" and out["spans_above_target"] == out["span_unit_count"]:
+        # Nothing to leave alone. Saying "leave the rest alone" when there is no
+        # rest reads as though some of the draft passed, and sends the caller
+        # looking for a safe part that does not exist.
+        out["next_action"] = (
+            f"Every one of the {out['span_unit_count']} units in this draft is above target, "
+            f"so there is nothing here to preserve on score grounds -- rewrite the whole "
+            f"passage in your own voice rather than patching spans, then call chain_submit "
+            f"again. The spans below are ranked worst-first if you want somewhere to start."
+        )
+    elif span_status == "ok":
+        keep = out["span_unit_count"] - out["spans_above_target_total"]
+        out["next_action"] = (
+            f"Rewrite the {out['spans_above_target']} span(s) below marked above_target=true "
+            f"in your own voice, then call chain_submit again. Leave the other {keep} "
+            f"unit(s) alone -- they are already at or below target."
         )
     elif span_status == "too_short":
         # One sentence has nothing to rank against.
@@ -569,6 +689,18 @@ def chain_submit(
         out["next_action"] = (
             "Revise and call chain_submit again. Pass span_feedback=true, or call "
             "detect_spans, to see which passages score worst."
+        )
+    # Every branch above except "target met" tells the caller to rewrite something.
+    # On a draft this short that instruction is built on a number that moves by
+    # more than the target itself between human passages of the same length, so
+    # the caveat has to come FIRST -- a caller that reads only next_action would
+    # otherwise never see it. Observed: a genuinely human 26-word note scored
+    # 0.4579 and was told to rewrite the offending span.
+    if short_note and verdict.score > target:
+        out["next_action"] = (
+            f"CAUTION: {short_note} If this draft is a section of something longer, "
+            f"finish the other sections and judge it with chain_assemble instead of "
+            f"revising it against this score. Otherwise: {out['next_action']}"
         )
     return out
 
@@ -653,6 +785,12 @@ def chain_history(
 ) -> dict:
     """Score trajectory for one segment -- step number, score, and note only.
 
+    Returns the most recent `limit` steps. On a long chain that is a window, not
+    the history: `total_steps` and `truncated` say so, and `best_step` /
+    `best_score` describe the whole segment, so the best draft stays reachable
+    even when it scrolled out of the window. Do not take the lowest score in
+    `trajectory` for the best draft -- compare against `best_step`.
+
     Text is omitted on purpose; use `chain_get_text` for a specific step.
     """
     try:
@@ -664,13 +802,32 @@ def chain_history(
     if segment not in known:
         return _fail(KeyError(f"no such segment '{segment}' in this chain; have {known}"))
     rows = store.history(chain_id, segment, limit)
-    return {
+    stats = store.segment_stats(chain_id, segment)
+    out = {
         "ok": True,
         "chain_id": chain_id,
         "segment": segment,
         "returned": len(rows),
+        # A 65-step segment queried at the default limit returned steps 36..65
+        # and called that the trajectory. The best draft was step 4. Nothing in
+        # the response said either that steps were missing or where the best one
+        # was, so the obvious move -- scan the trajectory, branch from its
+        # lowest score -- silently picked the best of the last thirty.
+        "total_steps": stats["steps"],
+        "truncated": stats["steps"] > len(rows),
+        "best_step": stats["best_step"],
+        "best_score": stats["best_score"],
         "trajectory": rows,
     }
+    shown = {r["step"] for r in rows}
+    if stats["best_step"] is not None and stats["best_step"] not in shown:
+        out["note"] = (
+            f"The best draft of this segment is step {stats['best_step']} "
+            f"({stats['best_score']}), which is older than the {len(rows)} step(s) shown. "
+            f"Raise `limit` to see it, chain_get_text(step='best') to read it, or "
+            f"chain_submit(branch_from={stats['best_step']}) to continue from it."
+        )
+    return out
 
 
 @mcp.tool
