@@ -3,6 +3,7 @@
 Suites, fastest first:
   smoke_test.py           plumbing + one real scoring pass
   tests/test_tools.py     all 13 tools over an in-memory MCP client, error paths
+  tests/test_usability.py the guidance a model actually gets: next_action, recovery
   tests/test_entrypoints.py  startup config, helper scripts, DB isolation
   tests/test_detector.py  precision, windowing, edge cases, determinism, chains
   tests/test_gpu_memory.py  idle unload, manual unload, threading under load
@@ -31,6 +32,7 @@ if not (os.environ.get("EDITLENS_DB") or "").strip():
 SUITES = [
     ("smoke", [sys.executable, "-u", str(ROOT / "smoke_test.py"), "--real"]),
     ("tools", [sys.executable, "-u", str(ROOT / "tests" / "test_tools.py")]),
+    ("usability", [sys.executable, "-u", str(ROOT / "tests" / "test_usability.py")]),
     ("concurrency", [sys.executable, "-u", str(ROOT / "tests" / "test_concurrency.py")]),
     ("offsets", [sys.executable, "-u", str(ROOT / "tests" / "test_offsets.py")]),
     ("branching", [sys.executable, "-u", str(ROOT / "tests" / "test_branching.py")]),

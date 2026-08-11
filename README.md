@@ -180,13 +180,30 @@ numbered **steps** (revisions).
 | `chain_list` | `limit=25` | List chains, most recently updated first. |
 | `chain_delete` | `chain_id` | Delete a chain and all its steps. Irreversible. |
 
-`chain_submit` returns `score`, `label`, `words`, `target_met`, `best_score`, `is_new_best`,
-`delta_vs_previous`, `delta_vs_best`, `next_action`, and `worst_spans`. If span analysis
-fails, `span_error` carries the reason rather than silently reporting no spans to fix.
+`chain_submit` returns `score`, `label`, `words`, `target_met`, `best_score`, `best_step`,
+`is_new_best`, `delta_vs_previous`, `delta_vs_best`, `next_action`, `worst_spans`, and
+`spans_above_target`. If span analysis fails, `span_error` carries the reason rather than
+silently reporting no spans to fix.
+
+**Rewrite only the spans marked `above_target`.** `worst_spans` is a ranking, not a
+to-do list — its tail is routinely text the same response labels `Human-written`, and
+rewriting that is how a loop makes a draft worse while believing it is following orders.
+When `spans_above_target` is 0 and the document is still above target, span-level work has
+bottomed out and `next_action` says so instead of sending you round again.
+
+`chain_status` returns `pending` (everything not at target) and splits it into `unstarted`
+and `above_target`, which need opposite responses. `latest_is_best` per segment — and
+`segments_with_better_earlier_draft` at the top — tell you whether the draft you last
+submitted is the one assembly will actually use.
 
 `chain_assemble` returns `document_score`, `per_segment`, `missing_segments`, `complete`,
-`score_met`, and `target_met`. **`target_met` requires `complete`** — a document missing a
-declared section is not finished, however well the parts that exist happen to score.
+`score_met`, `target_met`, and `segments_above_target`. **`target_met` requires `complete`** —
+a document missing a declared section is not finished, however well the parts that exist
+happen to score.
+
+Every chain tool returns `next_action`. It is the field to read first: it accounts for the
+regression case, the bottomed-out case, and the status/assemble disagreement, none of which
+are obvious from the numbers.
 
 ---
 
@@ -213,8 +230,14 @@ chain_submit(ch, text, segment="method")    ← chain_status shows what's pendin
 chain_assemble(ch)                          ← best-of-each, scored as one document
 ```
 
-Assemble at the end, always. A document routinely scores higher than any of its parts,
-because the model sees consistency across sections it cannot see in one section alone.
+Assemble before you decide a section needs more work, not after. The document score is
+not bounded by the section scores in either direction, and the gap is large: sections
+scoring 0.73 and 0.51 have assembled into a 0.11 document, because the model scores short
+text harder than the same words inside a longer piece. So `chain_status` can list a
+section as pending while `chain_assemble` calls the document finished — both are right,
+and `chain_assemble`'s `segments_above_target` plus its `next_action` say which one
+governs. It goes the other way too: a whole document can land above every part of it,
+which is why assembling is what ends a chain.
 
 **When a revision makes things worse**, history is append-only — nothing is lost. Pull the
 earlier draft back and fork from it, and the chain records the branch:
