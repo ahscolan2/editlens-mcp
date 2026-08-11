@@ -1,0 +1,5 @@
+# Normalise to LF in the repository so checkouts are identical on Windows,
+# macOS and Linux. Python does not care, but mixed endings make diffs noisy.
+* text=auto eol=lf
+*.png binary
+*.db binary
