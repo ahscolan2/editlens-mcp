@@ -136,10 +136,13 @@ async def main() -> None:
             bad = await call("chain_submit", {"chain_id": rid, "text": TEXT})
         assert bad["is_new_best"] is False and bad["best_step"] == good["step"], bad
         # best_step is the field that makes the advice actionable: branch_from
-        # takes a step number, and best_score alone does not supply one.
+        # takes a step number, and best_score alone does not supply one. The
+        # segment must be named in BOTH calls: they default to 'main' and step
+        # numbers are per-segment, so the unqualified instruction reads -- and
+        # writes -- another segment in any multi-segment chain.
         na = bad["next_action"]
-        assert f"chain_get_text(step={good['step']})" in na, na
-        assert f"branch_from={good['step']}" in na, na
+        assert f"chain_get_text(segment='main', step={good['step']})" in na, na
+        assert f"segment='main', branch_from={good['step']}" in na, na
         assert "do not keep editing this draft" in na.lower(), na
         print(f"  regression 0.04 -> 0.99: names step {good['step']}, "
               f"chain_get_text and branch_from")
@@ -299,11 +302,15 @@ async def main() -> None:
         na = t["next_action"]
         # The exact false claim. It must not survive anywhere in the response.
         assert "already at or below target" not in na, na
-        assert "12 units above target" in na and "other 7 are NOT shown" in na, na
-        assert "span_top" in na and "span_min_words" in na, na
-        print(f"  truncated spans: {t['spans_above_target']} shown of "
-              f"{t['spans_above_target_total']} above target in {t['span_unit_count']} "
-              f"units -- next_action says so instead of calling the other 7 fine")
+        # ALL 12 units failing is the whole-rewrite case, and it must win even
+        # though the list is truncated: which strategy the caller was told --
+        # "patch these 5" vs "rewrite everything" -- used to depend only on
+        # whether span_top happened to be >= unit_count, a display parameter
+        # selecting between mutually exclusive plans.
+        assert "Every one of the 12 units" in na, na
+        assert "rewrite the whole passage" in na, na
+        print(f"  all-12-above with span_top=5: whole-rewrite advice wins over the "
+              f"truncated-window wording (strategy no longer depends on span_top)")
 
         # A window that happens to hide only SOME failing units is the same bug.
         with _Stub(0.9, spans=[0.9, 0.1]):
@@ -454,6 +461,61 @@ async def main() -> None:
         assert blank["total_steps"] == 0 and blank["truncated"] is False, blank
         assert blank["best_step"] is None and "note" not in blank, blank
         print("  an empty segment reports total_steps=0 and no best step")
+
+        # ------------------------------------------------------------------
+        # 14. Guidance must know how many segments there are. A single-segment
+        #     chain (the default) was told to assemble first, where the
+        #     assembled score is arithmetically the segment's best score --
+        #     dozens of wasted forward passes over a long chain, each promising
+        #     a change that cannot happen. And a multi-segment chain was NEVER
+        #     told about chain_assemble in the submit loop, so an agent ground
+        #     every section to target in isolation.
+        # ------------------------------------------------------------------
+        solo = (await call("chain_create", {"name": "solo", "target_score": 0.25}))["chain_id"]
+        with _Stub(0.9, spans=[0.9, 0.9], words=80):
+            await call("chain_submit", {"chain_id": solo, "text": TEXT})
+        s1 = await call("chain_status", {"chain_id": solo})
+        assert "assembling adds nothing" in s1["next_action"], s1["next_action"]
+        assert "chain_assemble first" not in s1["next_action"], s1["next_action"]
+
+        multi = (await call("chain_create",
+                            {"name": "multi", "segments": ["intro", "body"]}))["chain_id"]
+        with _Stub(0.9, spans=[0.9, 0.9], words=80):
+            m = await call("chain_submit", {"chain_id": multi, "text": TEXT,
+                                            "segment": "intro"})
+        assert "chain_assemble" in m["next_action"], m["next_action"]
+        s2 = await call("chain_status", {"chain_id": multi})
+        assert "chain_submit with segment='body'" in s2["next_action"], s2["next_action"]
+        print("  single-segment status skips the useless assemble; multi-segment "
+              "submit names chain_assemble")
+
+        # ------------------------------------------------------------------
+        # 15. "Target met. Stop." on a 12-word draft declares a chain finished
+        #     on a score the SAME response flags unreliable -- the noise is
+        #     two-sided, and false completion is its worse direction.
+        # ------------------------------------------------------------------
+        shorty = (await call("chain_create", {"name": "short", "target_score": 0.25}))["chain_id"]
+        with _Stub(0.11, spans=[0.11], words=12):
+            sh = await call("chain_submit", {"chain_id": shorty, "text": "tiny draft"})
+        assert sh["target_met"] is True and sh["reliable"] is False
+        na = sh["next_action"]
+        assert na.startswith("Target met, BUT"), na
+        assert "Do not treat this as a pass on its own" in na, na
+        print("  target met on 12 words: next_action withholds the bare 'Stop'")
+
+        # chain_assemble carries the same short-text caveat on its "Done."
+        with _Stub(0.11, spans=[0.11], words=12):
+            asm_short = await call("chain_assemble", {"chain_id": shorty,
+                                                      "include_text": False})
+        assert asm_short["reliable"] is False and "reliability_note" in asm_short
+        assert "provisional" in asm_short["next_action"], asm_short["next_action"]
+        # ...and when it cannot hand back the text, it says how to get it.
+        with _Stub(0.9, spans=[0.9], words=80):
+            asm_fail = await call("chain_assemble", {"chain_id": shorty,
+                                                     "include_text": False})
+        assert "include_text=true" in asm_fail["next_action"], asm_fail["next_action"]
+        print("  assemble: short-text caveat on Done; include_text=False never "
+              "points at text the response does not carry")
 
     print("USABILITY TESTS PASSED")
 

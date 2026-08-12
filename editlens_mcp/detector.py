@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -244,7 +245,38 @@ def text_fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
+_CJK = re.compile(
+    # Han, Hiragana, Katakana (incl. halfwidth), and the CJK extension planes.
+    # Scripts written without spaces, where \b-delimited "words" are whole
+    # clauses: a Chinese paragraph measured 14.1 chars per regex-"word" against
+    # 4.9 for English, so every word-count threshold fired at ~3x the intended
+    # length. Each of these code points is closer to a morpheme than a letter.
+    r"[぀-ヿㇰ-ㇿ㐀-䶿一-鿿豈-﫿"
+    r"ｦ-ﾟ\U00020000-\U0002ebef]"
+)
+
+
 def count_words(text: str) -> int:
+    """Approximate word count, calibrated on English.
+
+    NFC first: combining marks are not \\w, so in NFD input (macOS filenames,
+    PDF extraction) every accented letter split its word in two and a 15-word
+    Vietnamese fragment counted as ~30 -- sailing past the reliability
+    thresholds exactly where they matter. Normalising only here keeps the
+    offset map untouched, because the text itself is never rewritten.
+
+    CJK: counted per character and divided by 2 (~2 chars per word-equivalent
+    for Han/Kana), replacing the \\b count that treated an unspaced clause as
+    one word. Still an approximation -- the 25/60-word thresholds were measured
+    on English and stay approximate for other scripts; the README says so.
+    """
+    text = unicodedata.normalize("NFC", text)
+    cjk = len(_CJK.findall(text))
+    if cjk:
+        # Strip CJK chars so the \b pass doesn't double-count runs mixing
+        # scripts ("GPT-4は" is one \b token containing both).
+        latin = len(_WORD.findall(_CJK.sub(" ", text)))
+        return latin + max(1, round(cjk / 2))
     return len(_WORD.findall(text))
 
 
@@ -534,8 +566,32 @@ class EditLensDetector:
 
     def _setup_hint(self, exc: Exception) -> str:
         msg = str(exc)
+        low = msg.lower()
         lines = [f"Could not load '{self.checkpoint}': {type(exc).__name__}: {msg}"]
-        if "torch" in msg or "transformers" in msg or isinstance(exc, ModuleNotFoundError):
+        # Cause before symptom. The offline/cold-cache failure is diagnosed
+        # FIRST because HuggingFace's own error text for it ends in a docs URL
+        # containing the substring "transformers" -- which used to trip the
+        # dependency branch below and tell an offline user to reinstall torch.
+        offline = (
+            "couldn't connect" in low
+            or "could not connect" in low
+            or "offline" in low
+            or "cached files" in low
+            or "connectionerror" in low
+            or "name resolution" in low
+        )
+        if offline:
+            lines.append(
+                "The checkpoint is not in the local HuggingFace cache and the "
+                "network is unreachable. The first run downloads ~1.4 GB -- "
+                "connect to the internet and retry. The repo is gated, so "
+                "HF_TOKEN (or `hf auth login`) must also be set on a fresh "
+                "machine."
+            )
+        # A dependency problem announces itself by exception TYPE. Substring
+        # matching on the message misfired: any error message quoting a
+        # huggingface.co/docs/transformers/... URL contains "transformers".
+        elif isinstance(exc, (ModuleNotFoundError, ImportError)):
             lines.append(
                 f"Install deps:  {self.torch_install_command()}"
                 "  &&  pip install fastmcp transformers safetensors"
@@ -823,11 +879,47 @@ class EditLensDetector:
         return [r for r in results if r is not None]
 
 
-# A sentence terminator, any trailing closing punctuation, then whitespace.
-# `re` forbids variable-width lookbehind, so boundaries are found with finditer
-# and the following character is checked manually.
-_SENT_END = re.compile(r"[.!?][\"'”’)\]]*\s+")
+# A sentence terminator, any trailing closing punctuation, then whitespace --
+# OR a fullwidth CJK terminator (。！？…), which needs no trailing whitespace
+# because those scripts don't put any: requiring \s+ made the old regex match
+# ZERO boundaries in an entire Chinese document, collapsing it to one unit and
+# silently disabling all span feedback. `re` forbids variable-width lookbehind,
+# so boundaries are found with finditer and the following char checked manually.
+_SENT_END = re.compile(r"[.!?][\"'”’)\]]*\s+|[。！？…][」』）】\"'”’)\]]*\s*")
 _SENT_START = re.compile(r"[A-Z0-9\"'“(\[]")
+_CJK_END = re.compile(r"[。！？…]")
+# A boundary is rejected when the "sentence" it would end is just an
+# abbreviation: "Dr. Chen" is not two sentences. Single capitals ("J. Smith")
+# and digit runs ("1. item", "Fig. 3") are handled structurally; the list
+# covers the common English title/latin abbreviations.
+_ABBREV = {
+    "dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "vs", "etc", "al",
+    "e.g", "i.e", "u.s", "u.k", "a.m", "p.m", "fig", "no", "vol", "cf", "ca",
+}
+_LAST_TOKEN = re.compile(r"[\w.'’-]+$")
+
+
+def _is_abbreviation(text: str, terminator_at: int) -> bool:
+    """True when the '.' at `terminator_at` ends an abbreviation, not a sentence."""
+    if terminator_at >= len(text) or text[terminator_at] != ".":
+        return False
+    tok = _LAST_TOKEN.search(text[: terminator_at + 1])
+    if not tok:
+        return False
+    word = tok.group().rstrip(".")
+    if not word:
+        return False
+    low = word.lower()
+    if low in _ABBREV or (len(word) == 1 and word.isalpha()):  # "Dr.", "J. Smith"
+        return True
+    if word.isdigit():
+        # A digit run is a LIST MARKER only at the start of a line ("1. item",
+        # " 2. next"). Mid-line, a number before a full stop is just how prose
+        # ends sentences -- "ran until 2024. It found..." -- and suppressing
+        # those boundaries mangled ordinary English to protect list formatting.
+        line_start = text.rfind("\n", 0, tok.start()) + 1
+        return not text[line_start : tok.start()].strip()
+    return False
 
 
 def _sentence_spans(text: str) -> list[tuple[int, int]]:
@@ -836,13 +928,41 @@ def _sentence_spans(text: str) -> list[tuple[int, int]]:
     for m in _SENT_END.finditer(text):
         end = m.end()
         nxt = text[end : end + 1]
-        # A blank line always ends a sentence; otherwise require a plausible start.
-        if not nxt or _SENT_START.match(nxt) or "\n\n" in m.group():
+        is_cjk = bool(_CJK_END.match(m.group()))
+        if _is_abbreviation(text, m.start()):
+            continue
+        # A blank line always ends a sentence; otherwise require a plausible
+        # start. A CJK terminator IS the plausibility -- the char after it is a
+        # Han or kana character that _SENT_START can never match.
+        if not nxt or is_cjk or _SENT_START.match(nxt) or "\n\n" in m.group():
             if text[start:end].strip():
                 spans.append((start, end))
             start = end
     if text[start:].strip():
         spans.append((start, len(text)))
+    return spans
+
+
+def _line_spans(text: str) -> list[tuple[int, int]]:
+    """One span per non-empty line, tiling the text exactly.
+
+    Each span runs to the start of the next non-empty line, so blank lines and
+    trailing whitespace are absorbed into the span before them -- the same
+    contract _sentence_spans keeps, which the offset-tiling tests rely on.
+    """
+    starts: list[int] = []
+    pos = 0
+    for line in text.split("\n"):
+        if line.strip():
+            starts.append(pos)
+        pos += len(line) + 1
+    if len(starts) < 2:
+        return []
+    spans: list[tuple[int, int]] = []
+    for i, s in enumerate(starts):
+        begin = 0 if i == 0 else s
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        spans.append((begin, end))
     return spans
 
 
@@ -866,6 +986,15 @@ def split_units(text: str, granularity: str = "sentence", min_words: int = 25) -
         return [p for p in pieces if text[p[0] : p[1]].strip()]
 
     raw = _sentence_spans(text)
+    if len(raw) < 2:
+        # No sentence boundary found. That is a statement about FORMATTING, not
+        # length: a 900-word hyphen-bulleted roadmap has plenty of full stops
+        # but every one is followed by "- ", which is no sentence start, so the
+        # whole document used to collapse to one unit and span feedback went
+        # dark. Lines are the boundaries the author actually wrote -- use them.
+        alt = _line_spans(text)
+        if len(alt) >= 2:
+            raw = alt
     if min_words <= 1:
         return [r for r in raw if text[r[0] : r[1]].strip()]
 

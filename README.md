@@ -11,7 +11,12 @@ normalised to `[0, 1]` — the same formula the official demo Space uses.
 
 Everything runs on your machine. No text leaves it.
 
-Runs on Windows, macOS (Apple Silicon via Metal), and Linux.
+Runs on Windows, macOS (Apple Silicon via Metal), and Linux. Python 3.10+.
+
+**Calibration note:** the model and this server's word-count thresholds (the 25-word
+`reliable` floor, the 60-word noise caveat) were measured on **English**. CJK text is
+counted by characters (≈2 per word-equivalent) and split on 。！？ so span feedback works,
+but scores and thresholds on non-English text are approximate — treat them as directional.
 
 ---
 
@@ -61,12 +66,17 @@ python run_tests.py
 
 ### Shortcut
 
-`setup.py` does steps 1, 2 and 4 for you, checks gated-model access, and prints the exact
-MCP client config for your machine — including the right interpreter path:
+`install.py` does steps 1 and 2 for you, checks step 3 (gated-model access), and prints the
+exact MCP client config for your machine — including the right interpreter path. It does
+**not** run step 4; run `python run_tests.py` yourself to verify:
 
 ```bash
-python setup.py
+python3 install.py
 ```
+
+(`python3` on macOS/Linux, `python` on Windows — macOS ships no bare `python`. The repo is
+**not** pip-installable: use this script, not `pip install .`. Python 3.10+ required;
+`install.py` checks and says so before downloading anything.)
 
 ### Note for macOS
 
@@ -92,10 +102,12 @@ enough that the added complexity would not pay for itself.
 The server speaks stdio. Point your client at `run_server.py` with an absolute path —
 `run_server.py` exists precisely because clients disagree about honouring a `cwd` setting.
 
-**Claude Code:**
+**Claude Code** (use `python3` on macOS/Linux — macOS has no bare `python` on PATH, and a
+server registered with one silently never launches; `install.py` prints the exact
+interpreter path to use):
 
 ```bash
-claude mcp add editlens --scope user -- python /absolute/path/to/MCP-EditLens/run_server.py
+claude mcp add editlens --scope user -- python3 /absolute/path/to/editlens-mcp/run_server.py
 ```
 
 **Any client that uses a JSON config** (Claude Desktop, Antigravity, Cursor, …):
@@ -104,15 +116,16 @@ claude mcp add editlens --scope user -- python /absolute/path/to/MCP-EditLens/ru
 {
   "mcpServers": {
     "editlens": {
-      "command": "python",
-      "args": ["/absolute/path/to/MCP-EditLens/run_server.py"]
+      "command": "python3",
+      "args": ["/absolute/path/to/editlens-mcp/run_server.py"]
     }
   }
 }
 ```
 
-On Windows use double backslashes in JSON (`"C:\\Users\\you\\MCP-EditLens\\run_server.py"`)
-and, if `python` is not on PATH, give the full interpreter path as `command`.
+If the interpreter is not on PATH under that name (`python3` on macOS/Linux, `python` on
+Windows), give the full interpreter path as `command` — `install.py` prints it. On Windows
+use double backslashes in JSON (`"C:\\Users\\you\\editlens-mcp\\run_server.py"`).
 
 Config file locations:
 
@@ -196,13 +209,13 @@ numbered **steps** (revisions).
 | Tool | Parameters | What it does |
 | --- | --- | --- |
 | `chain_create` | `name`, `target_score=0.25` (0.0–1.0), `goal=null`, `segments=null` | Open a chain. Duplicate segment names are de-duplicated. |
-| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `span_top=5` (1–50), `span_min_words=25` (1–200), `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. |
+| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `span_top=5` (1–50), `span_min_words=25` (1–200), `branch_from=null` | Score and store a draft; returns movement and worst spans, **not** the text. The draft is stored exactly as sent — whitespace is normalised on the way into the model, never into the store. |
 | `chain_status` | `chain_id` | Per-segment best/latest scores and what is still pending. |
 | `chain_history` | `chain_id`, `segment="main"`, `limit=30` (1–200) | Score trajectory. Numbers and notes only. `limit` keeps the most recent N steps; they come back oldest-first, with `returned` counting them. `total_steps`, `truncated`, `best_step` and `best_score` describe the whole segment, so a window never hides the best draft. An unknown `segment` is an error, not an empty trajectory. |
-| `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve a stored draft — `"best"`, `"latest"`, or a step number. |
-| `chain_assemble` | `chain_id`, `separator="\n\n"`, `include_text=true` | Join the best of every segment and score the whole document. |
-| `chain_list` | `limit=25` (1–200) | List chains, most recently updated first. |
-| `chain_delete` | `chain_id` | Delete a chain and all its steps. Irreversible. |
+| `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve a stored draft — `"best"`, `"latest"`, or a step number. Byte for byte what was submitted, so markdown nesting and code indentation survive and the `start`/`end` offsets from `chain_submit` index it directly. |
+| `chain_assemble` | `chain_id`, `separator="\n\n"`, `include_text=true` | Join the best of every segment and score the whole document. Each segment's own edge whitespace is stripped at the join — the separator decides what sits between sections. Carries `reliable`/`reliability_note` like `detect`. |
+| `chain_list` | `limit=25` (1–200) | List chains, most recently updated first. `best_score` is the lowest step score across **all** segments — a progress hint, not completion; `segments_at_target` / `segments_total` are the honest completion signals, counted against the declared list so an unstarted segment counts as not-at-target. |
+| `chain_delete` | `chain_id`, `segment=null` | Delete a chain and all its steps — or, with `segment`, just that segment (its drafts and its entry in the declared list). The escape hatch for a typo'd segment name, which would otherwise mark the chain incomplete forever. Irreversible either way. |
 
 `chain_submit` returns `step`, `parent_step`, `score`, `label`, `words`, `target_score`,
 `target_met`, `best_score`, `best_step`, `is_new_best`, `delta_vs_previous`, `delta_vs_best`,
@@ -398,11 +411,22 @@ Default database location (used only when `EDITLENS_DB` is unset or empty):
 | macOS | `~/Library/Application Support/editlens-mcp/chains.db` |
 | Linux | `$XDG_DATA_HOME/editlens-mcp/chains.db` (or `~/.local/share/...`) |
 
+`EDITLENS_DB` is expanded before use: `~/chains.db` and `$HOME/chains.db` (or
+`%LOCALAPPDATA%\...` on Windows) mean what they look like they mean, and relative paths are
+resolved once at startup, not against whatever working directory each launcher happens to
+supply. MCP client configs are JSON, not a shell — nothing else would ever expand these.
+
+If the database cannot be opened at all (unwritable directory, a half-copied file, an
+unmounted volume), the server still starts: the chain and detect tools return the error
+per-call, and `detector_info` — the tool to call first when anything is broken — reports
+the failure and the exact path it tried under `db_error`.
+
 The store opens in WAL mode where the filesystem allows it, and falls back to whatever
 journal mode it can get rather than refusing to start — some network filesystems reject WAL.
-`run_tests.py` points `EDITLENS_DB` at a fresh temp path before any suite runs — unless you
-set one yourself, which it leaves alone — so no suite can fall through to the default and run
-schema migrations against the operator's real database.
+`run_tests.py` forces `EDITLENS_DB` to a fresh temp path before any suite runs —
+unconditionally, even if you exported one yourself — so no test run can ever migrate or
+write a real chain database. `EDITLENS_TEST_DB` is the deliberate override if you need the
+tests to use a location of your choosing.
 
 ---
 
@@ -428,8 +452,10 @@ Eleven suites, in the order `run_tests.py` runs them:
 | `tests/test_gpu_memory.py` | idle unload, manual unload, threading under load |
 | `tests/test_client.py` | the real path — the server as a stdio subprocess, which is what MCP clients actually do |
 
-`run_tests.py` forces `EDITLENS_DB` to a temp path before any suite runs, so testing can
-never migrate or write your real chain database.
+`run_tests.py` forces `EDITLENS_DB` to a temp path before any suite runs — unconditionally
+— so testing can never migrate or write your real chain database (set `EDITLENS_TEST_DB`
+to choose the location deliberately). All suite temp files live under one directory,
+removed when every suite passes and kept, with its path printed, when one fails.
 
 Run this after changing anything. The subprocess suite in particular catches failures the
 in-process ones cannot, because tool functions run on a worker thread there.

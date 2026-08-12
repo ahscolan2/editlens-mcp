@@ -6,6 +6,27 @@ Nothing here is speculative: every claim is either verified, or explicitly label
 **Repo:** `C:\Users\Aryan\MCP-EditLens` on Windows, `git@github.com:ahscolan2/editlens-mcp`
 (private). Clean at `af7bc8d`, all 11 suites green **on Windows**.
 
+> **STATUS 2026-08-12 — everything below this box is historical.** A 6-dimension
+> audit (each finding adversarially verified) plus a fix round completed. ALL
+> findings in this file are FIXED: A1 (cwd), A2 (deps pinned to the measured
+> stack), A3 (repo-name paths, 4 places), and reported bugs 1–8 (verbatim
+> storage + raw offsets; the three next_action bugs; expanduser; the import
+> guard — detector_info now survives a dead store and reports `db_error`;
+> in-transaction lineage under concurrent submits; CJK counting/splitting plus
+> a line-boundary fallback for bullet lists; chain_list `segments_at_target`;
+> segment_stats best/latest words; chain_get_text segment validation;
+> run_tests.py now floors EDITLENS_DB unconditionally, `EDITLENS_TEST_DB` is
+> the escape hatch). Also new since then: `chain_delete(segment=...)` (the
+> typo'd-segment escape hatch), next_action on chain_create/chain_get_text,
+> single- vs multi-segment-aware guidance, chain_assemble reliability caveats,
+> `setup.py` renamed `install.py` (it was never a setuptools script and
+> `pip install .` executed it inside pip's build env), abbreviation-aware
+> sentence splitting, NFC-insensitive word counts, offline-vs-deps diagnosis in
+> `_setup_hint`. Every fix has a regression test; suites grew from these
+> rounds. Still open: real-Apple-Silicon validation (unchanged), span_min_words
+> 25-vs-15 (unchanged, needs data), no CI/pyproject (deliberate for now), and
+> the PEFT-adapter fallback remains the least-tested corner.
+
 **What it is:** an MCP server wrapping a local, gated HuggingFace AI-text detector
 (`pangram/editlens_roberta-large`; 0.0 = human-written, 1.0 = fully AI-generated), plus a
 SQLite chain store for long write → score → revise loops. 13 tools. See `README.md`.

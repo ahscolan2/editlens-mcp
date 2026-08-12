@@ -195,7 +195,11 @@ async def main() -> None:
                         {"name": "t", "target_score": 0.35, "segments": ["a", "b", "b"]})
         assert ch["ok"] and ch["segments"] == ["a", "b"], ch["segments"]  # de-duplicated
         cid = ch["chain_id"]
-        print(f"  chain_create: duplicate segment de-duplicated -> {ch['segments']}")
+        # A fresh chain must say what to do first -- the instructions promise a
+        # next_action, and "which segment do I draft?" is the immediate question.
+        assert "segment='a'" in ch["next_action"], ch
+        print(f"  chain_create: duplicate segment de-duplicated -> {ch['segments']}; "
+              f"next_action names the first segment")
 
         s1 = await call("chain_submit", {"chain_id": cid, "text": AI, "segment": "a",
                                          "note": "first pass"})
@@ -346,6 +350,32 @@ async def main() -> None:
         assert full["target_met"] == (full["complete"] and full["score_met"])
         print(f"  chain_assemble(full): score={full['document_score']:.3f} complete=True")
 
+        # ------------------------------------------- assemble vs edge whitespace
+        # Drafts are stored verbatim, so a segment now arrives at chain_assemble
+        # carrying its own leading indentation and trailing blank lines. Those
+        # must not leak into the scored document: clean_text collapses an indent
+        # run to one space instead of dropping it, and on the real checkpoint that
+        # single character moved a 314-word document by +0.15 -- enough to flip a
+        # target. The separator decides what sits between sections.
+        wid = (await call("chain_create", {"name": "ws", "segments": ["p", "q"]}))["chain_id"]
+        indented = "    for attempt in range(times):\n        return fn()\n\n\n"
+        trailing = HUMAN + "   \n\n\n"
+        await call("chain_submit", {"chain_id": wid, "text": indented, "segment": "p",
+                                    "span_feedback": False})
+        await call("chain_submit", {"chain_id": wid, "text": trailing, "segment": "q",
+                                    "span_feedback": False})
+        ws = await call("chain_assemble", {"chain_id": wid})
+        assert ws["ok"], ws
+        assert ws["text"] == "\n\n".join([indented.strip(), trailing.strip()]), (
+            f"assembled document carries segment edge whitespace: {ws['text']!r}")
+        # ...while the drafts themselves stay byte-for-byte what was submitted.
+        for seg, sent in (("p", indented), ("q", trailing)):
+            got = await call("chain_get_text", {"chain_id": wid, "segment": seg})
+            assert got["text"] == sent, f"segment {seg} not stored verbatim: {got['text']!r}"
+        await call("chain_delete", {"chain_id": wid})
+        print("  chain_assemble: segment edge whitespace stripped from the document, "
+              "drafts still stored verbatim")
+
         # ---------------------------------------------------------- status/history
         st = await call("chain_status", {"chain_id": cid})
         assert st["ok"] and st["total_steps"] == 4
@@ -381,6 +411,48 @@ async def main() -> None:
         assert lst["ok"] and any(x["chain_id"] == cid for x in lst["chains"])
         row = next(x for x in lst["chains"] if x["chain_id"] == cid)
         assert row["steps"] == 4 and row["segments"] == ["a", "b"]
+        # best_score is a cross-segment MIN and reads like a completion signal;
+        # these two are the honest ones, counted against the DECLARED list so an
+        # unstarted segment counts as not-at-target instead of dropping out.
+        assert row["segments_total"] == 2, row
+        assert 0 <= row["segments_at_target"] <= 2, row
+
+        # -------------------------------------------- get_text guidance/validation
+        # A typo'd segment must be named as such, with the valid names -- not
+        # reported as a missing step, which reads as "your draft is gone" at the
+        # exact moment the regression-recovery flow sent the caller here.
+        typo = await call("chain_get_text", {"chain_id": cid, "segment": "aa"})
+        assert typo["ok"] is False and "no such segment 'aa'" in typo["error"], typo
+        assert "'a'" in typo["error"], f"valid names missing from: {typo['error']}"
+        # Recovery is a two-step procedure; the response that hands back the
+        # draft must name step two, segment included.
+        assert f"branch_from={best['step']}" in best["next_action"], best
+        assert "segment='a'" in best["next_action"], best
+
+        # ------------------------------------------------------ segment delete
+        # The escape hatch for a typo'd segment name, which otherwise leaves
+        # chain_assemble reporting the chain incomplete forever.
+        wid = (await call("chain_create", {"name": "typo", "segments": ["real", "raal"]}))["chain_id"]
+        await call("chain_submit", {"chain_id": wid, "text": HUMAN, "segment": "raal",
+                                    "span_feedback": False})
+        gone = await call("chain_delete", {"chain_id": wid, "segment": "raal"})
+        assert gone["ok"] and gone["deleted_steps"] == 1, gone
+        assert gone["remaining_segments"] == ["real"], gone
+        st_after = await call("chain_status", {"chain_id": wid})
+        assert [s["segment"] for s in st_after["segments"]] == ["real"], st_after
+        bad_seg_del = await call("chain_delete", {"chain_id": wid, "segment": "ghost"})
+        assert bad_seg_del["ok"] is False and "no such segment" in bad_seg_del["error"]
+        last = await call("chain_delete", {"chain_id": wid, "segment": "real"})
+        assert last["ok"] is False and "only segment" in last["error"], last
+        await call("chain_delete", {"chain_id": wid})
+        print("  chain_delete(segment=...): removes drafts and the declared entry "
+              "together; refuses ghosts and the last segment")
+
+        # ------------------------------------------------------- info db fields
+        inf2 = await call("detector_info")
+        assert Path(inf2["db_path"]).is_absolute(), inf2["db_path"]
+        assert inf2["db_path_configured"] == os.environ["EDITLENS_DB"], inf2
+        assert "db_error" not in inf2, "healthy store must not report db_error"
 
         # ------------------------------------------------------------ error paths
         errors = {

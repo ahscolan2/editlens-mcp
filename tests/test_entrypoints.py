@@ -6,7 +6,7 @@ These paths run before the server can report anything, or instead of it:
   only a launch that exited;
 * the smoke test imports the server, which opens a ChainStore the moment it is
   imported -- at the operator's real database unless something says otherwise;
-* setup.py is the tool people run when their install is broken, so it must
+* install.py is the tool people run when their install is broken, so it must
   survive the broken install rather than tracebacking on it.
 """
 
@@ -165,53 +165,149 @@ def test_run_tests_forces_a_temp_database():
     nothing today -- which is exactly why it needs its own test. It is what stops
     a suite added tomorrow from falling through to default_db_path() and running
     schema migrations against the operator's live chain database.
-    """
-    from editlens_mcp.chains import default_db_path
 
+    The floor is UNCONDITIONAL: an exported EDITLENS_DB (the natural setup for
+    someone relocating their chains) is exactly the case where honouring it
+    would point the test run at the live database -- the one thing the README
+    promises can never happen. EDITLENS_TEST_DB is the escape hatch.
+    """
     fake_home = Path(tempfile.mkdtemp())
     probe = (
         "import sys, os; sys.path.insert(0, r'%s')\n"
         "import run_tests\n"
         "print('DB=' + os.environ.get('EDITLENS_DB', '<unset>'))\n"
+        # The REAL default under this environment, computed in the child with
+        # the override popped. Computing it in the parent was vacuous: this
+        # module sets its own EDITLENS_DB at import, so default_db_path() there
+        # returned our own temp path and the fall-through assertion compared
+        # two unrelated temp files.
+        "os.environ.pop('EDITLENS_DB', None)\n"
+        "import importlib, editlens_mcp.chains as ch\n"
+        "print('DEFAULT=' + str(ch.default_db_path()))\n"
     ) % ROOT
 
-    def ask(value):
+    def ask(value, test_db=None):
         env = dict(os.environ)
         env.pop("EDITLENS_DB", None)
+        env.pop("EDITLENS_TEST_DB", None)
         for var in ("LOCALAPPDATA", "XDG_DATA_HOME", "USERPROFILE", "HOME"):
             env[var] = str(fake_home)
         if value is not None:
             env["EDITLENS_DB"] = value
+        if test_db is not None:
+            env["EDITLENS_TEST_DB"] = test_db
         p = subprocess.run([PY, "-c", probe], env=env, capture_output=True,
                            text=True, cwd=str(ROOT), timeout=300)
         assert p.returncode == 0, p.stdout[-400:] + p.stderr[-400:]
         line = [ln for ln in p.stdout.splitlines() if ln.startswith("DB=")][-1]
-        return line[3:], env
+        dline = [ln for ln in p.stdout.splitlines() if ln.startswith("DEFAULT=")][-1]
+        return line[3:], dline[8:]
 
-    default = str(default_db_path())
-    for value in (None, "", "   "):
-        got, env = ask(value)
+    # Unset, empty, whitespace, AND an explicit real-looking path: every one
+    # must be floored to the run's own temp file.
+    exported = str(Path(tempfile.mkdtemp()) / "my-real-chains.db")
+    for value in (None, "", "   ", exported):
+        got, real_default = ask(value)
         assert got not in ("", "<unset>"), f"EDITLENS_DB={value!r} left it {got!r}"
-        assert Path(got).name == "run_tests.db", got
-        assert got != default, (
+        assert Path(got).name == "run_tests.db", (
+            f"EDITLENS_DB={value!r} was not floored: {got}")
+        assert got != real_default, (
             f"EDITLENS_DB={value!r} fell through to the operator's database: {got}")
-        # And nothing under the fake home was created merely by importing.
         assert not list(fake_home.rglob("chains.db*")), list(fake_home.rglob("chains.db*"))
+    # ...and the floored path never points into the fake home's default area.
+    assert not got.startswith(str(fake_home / "editlens-mcp")), got
 
-    # An explicit path the operator set must be left exactly as it is.
+    # EDITLENS_TEST_DB is the deliberate override, and only it is honoured.
     mine = str(Path(tempfile.mkdtemp()) / "mine.db")
-    got, _ = ask(mine)
-    assert got == mine, f"run_tests.py overrode an explicit EDITLENS_DB: {got}"
-    print("  run_tests.py floors EDITLENS_DB (empty counts as unset) and keeps an "
-          "explicit one")
+    got, _ = ask(exported, test_db=mine)
+    assert got == mine, f"EDITLENS_TEST_DB was not honoured: {got}"
+    print("  run_tests.py floors EDITLENS_DB unconditionally; EDITLENS_TEST_DB "
+          "is the only override")
 
 
-def test_setup_survives_a_torch_that_raises_oserror():
-    """setup.py repairs broken installs, so it must not die on one.
+def test_editlens_db_tilde_and_vars_expand():
+    """`EDITLENS_DB=~/foo.db` must mean the home directory, not a dir named '~'.
+
+    MCP client configs are JSON, not a shell: nothing else ever expands `~` or
+    `$HOME`, and the project's own docs write every macOS path in `~/...` form.
+    Taken verbatim, the override created a literal `~` directory under whatever
+    cwd the launcher supplied, and the chains silently accumulated in a
+    different place per launcher.
+    """
+    from editlens_mcp.chains import default_db_path
+
+    fake_home = Path(tempfile.mkdtemp())
+    env = {
+        "HOME": str(fake_home), "USERPROFILE": str(fake_home),
+        "MYVAR": str(fake_home),
+    }
+    probe = (
+        "import sys, os; sys.path.insert(0, r'%s')\n"
+        "from editlens_mcp.chains import default_db_path\n"
+        "print('P=' + str(default_db_path()))\n"
+    ) % ROOT
+
+    for value, why in [
+        ("~/sub/chains.db", "tilde"),
+        (os.path.join("$MYVAR", "sub", "chains.db"), "env var"),
+        ("%MYVAR%\\sub\\chains.db" if os.name == "nt" else "$MYVAR/sub/chains.db",
+         "platform var"),
+    ]:
+        e = dict(os.environ); e.update(env); e["EDITLENS_DB"] = value
+        p = subprocess.run([PY, "-c", probe], env=e, capture_output=True,
+                           text=True, cwd=str(ROOT), timeout=300)
+        assert p.returncode == 0, p.stderr[-400:]
+        got = [ln for ln in p.stdout.splitlines() if ln.startswith("P=")][-1][2:]
+        assert "~" not in got and "$" not in got and "%" not in got, (why, got)
+        assert got.startswith(str(fake_home)), (why, got, fake_home)
+        assert Path(got).is_absolute(), (why, got)
+    print("  EDITLENS_DB expands ~ and env vars and resolves to an absolute path")
+
+
+def test_broken_database_does_not_kill_the_tools():
+    """A store that cannot open must degrade to per-call errors, not a dead process.
+
+    `store = ChainStore(...)` at module scope was the only unguarded I/O in
+    server.py: an unwritable path or a half-copied chains.db killed the import
+    before FastMCP registered a single tool -- including detector_info, whose
+    own docstring says to call it first when anything errors. The realistic
+    trigger is the Mac migration itself: a chains.db copied mid-sync arrives
+    truncated, and the server it lands under must say so, not vanish.
+    """
+    bad_parent = Path(tempfile.mkdtemp()) / "blocker"
+    bad_parent.write_text("a file where a directory must go", encoding="utf-8")
+    probe = (
+        "import sys; sys.path.insert(0, r'%s')\n"
+        "from editlens_mcp import server\n"
+        "unwrap = lambda f: f.fn if hasattr(f, 'fn') else f\n"
+        "i = unwrap(server.detector_info)()\n"
+        "print('INFO_OK', i['ok'])\n"
+        "print('HAS_DB_ERROR', 'db_error' in i and bool(i['db_error']))\n"
+        "r = unwrap(server.chain_list)()\n"
+        "print('LIST_OK', r['ok'])\n"
+        "print('LIST_NAMES_CAUSE', 'chain store failed to open' in r.get('error', ''))\n"
+    ) % ROOT
+    env = dict(os.environ)
+    env["EDITLENS_DB"] = str(bad_parent / "chains.db")
+    p = subprocess.run([PY, "-c", probe], env=env, capture_output=True,
+                       text=True, cwd=str(ROOT), timeout=300)
+    assert p.returncode == 0, (
+        f"a bad EDITLENS_DB killed the import:\n{p.stderr[-600:]}")
+    out = p.stdout
+    assert "INFO_OK True" in out, out[-400:]
+    assert "HAS_DB_ERROR True" in out, out[-400:]
+    assert "LIST_OK False" in out, out[-400:]
+    assert "LIST_NAMES_CAUSE True" in out, out[-400:]
+    print("  unopenable database: server imports, detector_info reports db_error, "
+          "chain tools fail per-call naming the cause")
+
+
+def test_install_survives_a_torch_that_raises_oserror():
+    """install.py repairs broken installs, so it must not die on one.
 
     A torch that is installed but unloadable raises OSError on Windows
     ("[WinError 126] ... error loading fbgemm.dll") -- detector.py catches
-    broadly for precisely this. setup.py caught only ImportError, so the case it
+    broadly for precisely this. it caught only ImportError, so the case it
     exists to fix escaped as a raw traceback and no reinstall was attempted.
     """
     fake = Path(tempfile.mkdtemp())
@@ -226,21 +322,21 @@ def test_setup_survives_a_torch_that_raises_oserror():
         "import sys\n"
         f"sys.path.insert(0, r'{fake}')\n"
         f"sys.path.insert(0, r'{ROOT}')\n"
-        "import setup\n"
+        "import install\n"
         "calls = []\n"
-        "setup.run = lambda cmd: (calls.append(cmd), 0)[1]\n"
-        "setup.check_hf = lambda: None\n"
-        "rc = setup.main()\n"
+        "install.run = lambda cmd: (calls.append(cmd), 0)[1]\n"
+        "install.check_hf = lambda: None\n"
+        "rc = install.main()\n"
         "print('RC', rc)\n"
         "print('INSTALLED_TORCH', any('torch' in c for c in calls))\n"
     )
     p = subprocess.run([PY, "-c", harness], capture_output=True, text=True,
                        cwd=str(ROOT), timeout=600)
     assert "Traceback" not in p.stderr, (
-        f"setup.py crashed on an unloadable torch:\n{p.stderr[-800:]}")
+        f"install.py crashed on an unloadable torch:\n{p.stderr[-800:]}")
     assert "RC " in p.stdout, p.stdout[-400:] + p.stderr[-400:]
     assert "INSTALLED_TORCH True" in p.stdout, (
-        f"setup.py did not attempt to reinstall torch:\n{p.stdout[-400:]}")
+        f"install.py did not attempt to reinstall torch:\n{p.stdout[-400:]}")
     print("  unloadable torch triggers the reinstall path instead of a traceback")
 
 
@@ -300,6 +396,8 @@ if __name__ == "__main__":
     test_batch_size_below_one_is_clamped()
     test_smoke_test_never_touches_the_default_database()
     test_run_tests_forces_a_temp_database()
-    test_setup_survives_a_torch_that_raises_oserror()
+    test_editlens_db_tilde_and_vars_expand()
+    test_broken_database_does_not_kill_the_tools()
+    test_install_survives_a_torch_that_raises_oserror()
     test_submit_losing_a_race_with_delete_reports_the_chain()
     print("ENTRYPOINT TESTS PASSED")

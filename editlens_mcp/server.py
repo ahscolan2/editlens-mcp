@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 from functools import wraps
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -21,7 +22,6 @@ from .chains import ChainStore, default_db_path
 from .detector import (
     DetectorUnavailable,
     EditLensDetector,
-    clean_text,
     clean_text_with_map,
     count_words,
     map_span,
@@ -39,7 +39,8 @@ mcp = FastMCP(
         "`chain_submit` after every draft: it stores the text on disk and returns only the score "
         "delta plus the worst spans, so a chain can run for hundreds of steps cheaply. "
         "Use `chain_assemble` to score the concatenation of a multi-section chain. "
-        "Every chain tool returns a `next_action` -- follow it rather than inferring a plan "
+        "chain_create, chain_submit, chain_status, chain_get_text and chain_assemble return "
+        "a `next_action` -- follow it rather than inferring a plan "
         "from the scores, because two things about those scores are counter-intuitive. "
         "First, scores are not comparable across lengths: the model scores a sentence or a "
         "section harder than the same words inside a whole document, so parts routinely score "
@@ -83,7 +84,46 @@ detector = EditLensDetector(
 )
 # default_db_path() re-reads EDITLENS_DB and treats an empty value as unset.
 # Passing os.environ.get(...) here instead handed it "" and crashed at import.
-store = ChainStore(default_db_path())
+#
+# The construction is guarded because this line is the only I/O at import and
+# was the only statement in the file outside _guard's protection: an unwritable
+# directory, a path component that is a file, or a chains.db that arrived
+# half-copied ("file is not a database") killed the process before FastMCP
+# registered a single tool -- including detector_info, whose docstring says to
+# call it first when things break. Now the 12 chain/detect tools fail per-call
+# with the real reason, and detector_info stays alive to report it.
+class _BrokenStore:
+    """Stands in for ChainStore when the database could not be opened.
+
+    Every attribute access raises the captured error, so each tool that needs
+    the store returns an ok=False dict (via _guard) naming the actual problem
+    instead of the server dying at import.
+    """
+
+    def __init__(self, error: str, path) -> None:
+        self.error = error
+        self.path = path
+
+    def __getattr__(self, name: str):
+        raise RuntimeError(self.error)
+
+
+def _open_store():
+    path = default_db_path()
+    try:
+        return ChainStore(path), None
+    except Exception as exc:  # noqa: BLE001 - import-time boundary
+        msg = (
+            f"chain store failed to open: {type(exc).__name__}: {exc} "
+            f"(EDITLENS_DB={os.environ.get('EDITLENS_DB')!r} resolved to '{path}'). "
+            f"detect/detect_batch/detect_spans and the chain tools need this "
+            f"database; fix the path and restart the server."
+        )
+        print(f"[editlens] warning: {msg}", file=sys.stderr)
+        return _BrokenStore(msg, path), msg
+
+
+store, STORE_ERROR = _open_store()
 
 MAX_SPAN_REPORT = 5
 # Merge threshold for span feedback, matching detect_spans' own default.
@@ -228,8 +268,17 @@ def detector_info() -> dict:
     # "ok" on the success path too: _guard supplies it on failure, and a client
     # branching on result["ok"] should not KeyError when nothing went wrong.
     info = {"ok": True, **detector.info()}
-    info["db_path"] = str(store.path)
-    info["duplicate_steps_present"] = store.duplicate_steps_present
+    # Resolved, not the configured string: a relative EDITLENS_DB used to be
+    # echoed back verbatim ("chains.db"), which names no location on disk.
+    info["db_path"] = str(Path(store.path).resolve())
+    info["db_path_configured"] = os.environ.get("EDITLENS_DB")
+    if STORE_ERROR is not None:
+        # This tool's whole job is answering "why is everything broken?" --
+        # so it reports a dead chain store rather than dying of one.
+        info["db_error"] = STORE_ERROR
+        info["duplicate_steps_present"] = None
+    else:
+        info["duplicate_steps_present"] = store.duplicate_steps_present
     return info
 
 
@@ -442,9 +491,17 @@ def chain_create(
     composing a long document section by section.
     """
     try:
-        return {"ok": True, **store.create(name, target_score, goal, segments)}
+        created = store.create(name, target_score, goal, segments)
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)
+    first = created["segments"][0] if created.get("segments") else "main"
+    return {
+        "ok": True,
+        **created,
+        "next_action": (
+            f"Draft segment '{first}' and call chain_submit(segment='{first}')."
+        ),
+    }
 
 
 @mcp.tool
@@ -507,22 +564,43 @@ def chain_submit(
         segs = json.loads(chain["segments"])
         is_new_segment = segment not in segs
 
+        # The caller-visible previous draft: what the agent was actually
+        # revising when it built this submission. Used ONLY for parent_step --
+        # everything comparative (is_new_best, best_step, the deltas) is
+        # recomputed inside add_step's transaction below, because these
+        # pre-scoring reads are seconds stale by insert time and under
+        # concurrent submits every racer would otherwise crown itself the best.
         prev = store.latest_step(chain_id, segment)
-        prev_best = store.best_step(chain_id, segment)
         if branch_from is not None and store.get_step(chain_id, segment, branch_from) is None:
             return _fail(KeyError(f"cannot branch from step {branch_from}: no such step "
                                   f"in segment '{segment}'"))
-        # Score BEFORE registering a new segment. Registering first means a
-        # failed submit -- empty text, a typo'd segment name, a CUDA OOM -- still
-        # commits the segment, after which chain_assemble reports the chain
-        # permanently incomplete with no way to remove it again.
+        # Score BEFORE touching the store. Scoring first means a failed submit
+        # -- empty text, a CUDA OOM -- writes nothing at all. The segment is
+        # then registered inside add_step's OWN transaction (register_segment),
+        # not in a separate call before it: a separate registration that
+        # committed before an add_step that then failed ("database is locked")
+        # left a declared segment with zero steps, which chain_assemble
+        # reported as incomplete forever.
         verdict, _ = detector.detect(text)
-        if is_new_segment:
-            segs = store.add_segment(chain_id, segment)
-        step_no = store.add_step(
+        step_result = store.add_step(
             chain_id,
             segment,
-            clean_text(text),
+            # The caller's ORIGINAL, not clean_text(text). Normalisation belongs
+            # on the way into the model, not into the store. It collapses every
+            # run of spaces to one, so a draft came back from chain_get_text with
+            # markdown nesting flattened, code indentation destroyed (a fenced
+            # Python block returned as an IndentationError) and table alignment
+            # gone -- 14 of 27 lines altered on an ordinary document, and every
+            # indent level collapsed to the SAME single space, so the nesting
+            # could not be reconstructed. It also left the offsets and
+            # source_fingerprint below -- both computed against `text` --
+            # describing a string no tool ever returned: splicing a rewrite at
+            # them into what chain_get_text handed back cut across sentence
+            # boundaries, and the drift grows with the document (129 characters
+            # at 3 kB). detect() normalises internally, so scores, word counts,
+            # labels and assembled documents are unaffected by storing the
+            # original here.
+            text,
             verdict.score,
             verdict.bucket,
             verdict.label,
@@ -531,7 +609,12 @@ def chain_submit(
             note,
             # Default parent is the previous draft; branch_from forks elsewhere.
             branch_from if branch_from is not None else (prev["step_no"] if prev else None),
+            register_segment=is_new_segment,
+            with_lineage=True,
         )
+        step_no, tx_latest, tx_best = step_result
+        if is_new_segment:
+            segs = store.segments_of(chain_id)
     except sqlite3.IntegrityError as exc:
         # The only foreign key on `steps` is chain_id -> chains(id), so this means
         # the chain was deleted between the lookup above and the insert -- the
@@ -549,6 +632,13 @@ def chain_submit(
         return _fail(exc)
 
     target = float(chain["target_score"])
+    # tx_latest/tx_best were read inside the SAME transaction that inserted this
+    # step, so they see every draft committed before it -- including ones by
+    # concurrent submitters during the seconds this call spent scoring. Computed
+    # from the pre-scoring snapshot instead, 12 racing submits each reported
+    # is_new_best=true and best_step=<itself>, steering the caller onto the
+    # worst draft while the regressed branch below never fired.
+    prev_best = tx_best
     is_new_best = prev_best is None or verdict.score < prev_best["score"]
     best_score = min(verdict.score, prev_best["score"]) if prev_best else verdict.score
     # The step NUMBER of the best draft, not just its score. branch_from takes a
@@ -569,7 +659,12 @@ def chain_submit(
         "best_score": round(best_score, 4),
         "best_step": best_step,
         "is_new_best": is_new_best,
-        "delta_vs_previous": round(verdict.score - prev["score"], 4) if prev else None,
+        # delta_vs_previous compares against the true previous step in the
+        # segment (in-transaction read); parent_step stays the draft the CALLER
+        # was revising -- under a race those are different rows, and stamping a
+        # racer's draft as the parent would fabricate lineage between drafts
+        # written independently.
+        "delta_vs_previous": round(verdict.score - tx_latest["score"], 4) if tx_latest else None,
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
         "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
     }
@@ -622,14 +717,34 @@ def chain_submit(
     )
 
     if verdict.score <= target:
-        out["next_action"] = "Target met. Stop, or call chain_assemble if other segments remain."
+        if short_note:
+            # A short draft passes on the same noise that fails one: known-human
+            # passages under 25 words scored 0.02..0.69 on nothing but length.
+            # The old branch said a bare "Stop" here, declaring a chain finished
+            # on a score the SAME response flagged unreliable. False completion
+            # is the worse direction of that error.
+            out["next_action"] = (
+                f"Target met, BUT {short_note} Do not treat this as a pass on its "
+                f"own -- score it inside the full document (chain_assemble, or "
+                f"detect on the whole piece) before stopping."
+            )
+        else:
+            out["next_action"] = (
+                "Target met. Stop, or call chain_assemble if other segments remain."
+            )
     elif regressed:
+        # segment= is interpolated into BOTH calls. Without it they fall back
+        # to segment='main', and step numbers are per-segment: in a
+        # multi-segment chain, following the bare instruction verbatim silently
+        # returned another segment's draft and filed the rewrite under it, all
+        # with ok=True.
         out["next_action"] = (
             f"Worse than step {best_step} ({round(prev_best['score'], 4)} vs "
             f"{round(verdict.score, 4)}). Do not keep editing this draft. Call "
-            f"chain_get_text(step={best_step}) to recover the better one, then submit your "
-            f"next attempt with branch_from={best_step}. Nothing is lost -- this draft "
-            f"stays in the history as step {step_no}."
+            f"chain_get_text(segment='{segment}', step={best_step}) to recover the better "
+            f"one, then submit your next attempt with segment='{segment}', "
+            f"branch_from={best_step}. Nothing is lost -- this draft stays in the "
+            f"history as step {step_no}."
         )
     elif span_status == "ok" and out["spans_above_target"] == 0:
         # Every span is already at or below target and the document is not. More
@@ -641,6 +756,18 @@ def chain_submit(
             f"do not rewrite the spans below. {SCALE_NOTE} Whatever is left is document-level: "
             f"try reordering, cutting the opening or closing sentence, varying sentence "
             f"length, or rewriting the passage from scratch. Then call chain_submit again."
+        )
+    elif span_status == "ok" and out["spans_above_target_total"] == out["span_unit_count"]:
+        # Tested BEFORE the truncated branch, and on the whole-draft totals
+        # rather than the returned slice: when every unit is failing, whether
+        # the caller was told "patch these 5" or "rewrite the whole thing" used
+        # to depend only on span_top -- two mutually exclusive strategies
+        # selected by a display parameter.
+        out["next_action"] = (
+            f"Every one of the {out['span_unit_count']} units in this draft is above target, "
+            f"so there is nothing here to preserve on score grounds -- rewrite the whole "
+            f"passage in your own voice rather than patching spans, then call chain_submit "
+            f"again. The spans below are ranked worst-first if you want somewhere to start."
         )
     elif span_status == "ok" and out["spans_truncated"]:
         # "Leave the rest alone -- they are already at or below target" was a
@@ -657,16 +784,6 @@ def chain_submit(
             f"are NOT fine. Raise span_top to see more of them per round, or lower "
             f"span_min_words for smaller spans, so each rewrite replaces less text."
         )
-    elif span_status == "ok" and out["spans_above_target"] == out["span_unit_count"]:
-        # Nothing to leave alone. Saying "leave the rest alone" when there is no
-        # rest reads as though some of the draft passed, and sends the caller
-        # looking for a safe part that does not exist.
-        out["next_action"] = (
-            f"Every one of the {out['span_unit_count']} units in this draft is above target, "
-            f"so there is nothing here to preserve on score grounds -- rewrite the whole "
-            f"passage in your own voice rather than patching spans, then call chain_submit "
-            f"again. The spans below are ranked worst-first if you want somewhere to start."
-        )
     elif span_status == "ok":
         keep = out["span_unit_count"] - out["spans_above_target_total"]
         out["next_action"] = (
@@ -675,11 +792,26 @@ def chain_submit(
             f"unit(s) alone -- they are already at or below target."
         )
     elif span_status == "too_short":
-        # One sentence has nothing to rank against.
-        out["next_action"] = (
-            "Too short to pinpoint spans. Rewrite the whole passage in your own voice, "
-            "then call chain_submit again."
-        )
+        # One unit has nothing to rank against -- but say WHY there is one
+        # unit. This branch used to claim "too short" unconditionally, and the
+        # split failing on formatting (a bullet list, a table, verse) is not
+        # shortness: a 950-word draft was told it was too short to analyse
+        # while three numeric fields said zero units were above target, which
+        # reads as "nothing to fix". With the line-boundary fallback in
+        # split_units this now fires mostly on genuinely short text, but the
+        # single-long-line case still exists.
+        if verdict.word_count >= RELIABLE_WORDS:
+            out["next_action"] = (
+                "Could not divide this draft into rankable spans (no sentence "
+                "boundaries or line breaks found -- the document score above is "
+                "still valid). Rewrite the whole passage in your own voice, or "
+                "add paragraph breaks and resubmit to get span-level feedback."
+            )
+        else:
+            out["next_action"] = (
+                "Too short to pinpoint spans. Rewrite the whole passage in your own voice, "
+                "then call chain_submit again."
+            )
     elif span_status == "failed":
         out["next_action"] = (
             "Span analysis failed (see span_error); the score above is still valid. "
@@ -689,6 +821,19 @@ def chain_submit(
         out["next_action"] = (
             "Revise and call chain_submit again. Pass span_feedback=true, or call "
             "detect_spans, to see which passages score worst."
+        )
+    # In a multi-segment chain, every failing branch above says "revise and
+    # resubmit" -- and an agent following that literally grinds each section to
+    # target in isolation, dozens of rewrites, when the assembled document
+    # would already have passed: sections routinely score far above the
+    # document they compose. Only chain_assemble's docstring said so, and an
+    # agent revising in a submit loop never has a reason to read it. Skipped
+    # when the short-text CAUTION below fires, which gives the same advice.
+    if len(segs) > 1 and verdict.score > target and not regressed and not short_note:
+        out["next_action"] += (
+            f" This is one of {len(segs)} sections, and section scores run high in "
+            f"isolation. Once every section has a draft, call chain_assemble before "
+            f"grinding this one further -- the document score decides completion."
         )
     # Every branch above except "target met" tells the caller to rewrite something.
     # On a draft this short that instruction is built on a number that moves by
@@ -756,6 +901,16 @@ def chain_status(
             f"Draft the segment(s) with no steps yet: {unstarted}. Call chain_submit "
             f"with segment='{unstarted[0]}'."
         )
+    elif above and len(stats) == 1:
+        # One segment: the assembled document IS this segment's best draft, so
+        # the assemble-first advice below would send the caller on a
+        # guaranteed-useless round trip -- the score is arithmetically the
+        # best_score already shown here -- while promising a change that cannot
+        # happen.
+        out["next_action"] = (
+            f"One segment: its score IS the document score, so assembling adds "
+            f"nothing. Revise '{stats[0]['segment']}' with chain_submit."
+        )
     elif above:
         out["next_action"] = (
             f"Call chain_assemble first: {SCALE_NOTE} The assembled document often "
@@ -763,15 +918,26 @@ def chain_status(
             f"is what decides completion. Only if the document is still above target, "
             f"revise {above} with chain_submit."
         )
+    elif len(stats) == 1:
+        out["next_action"] = (
+            "The segment meets target, and with one segment its score IS the "
+            "document score. Done -- no assemble needed."
+        )
     else:
         out["next_action"] = (
             "Every segment meets target. Call chain_assemble to score the whole "
             "document -- assembly is what decides completion, not these per-segment scores."
         )
     if stale:
+        # One instruction PER segment, each naming its segment. A single
+        # chain_get_text(step='best') covering a list of segments defaults to
+        # segment='main' and reads the wrong one.
+        recover = "; ".join(
+            f"chain_get_text(segment='{s}', step='best')" for s in stale
+        )
         out["next_action"] += (
             f" Note: in {stale} your latest draft scores worse than an earlier one; "
-            f"assembly will use the earlier one. chain_get_text(step='best') retrieves it."
+            f"assembly will use the earlier one. Retrieve with {recover}."
         )
     return out
 
@@ -821,11 +987,15 @@ def chain_history(
     }
     shown = {r["step"] for r in rows}
     if stats["best_step"] is not None and stats["best_step"] not in shown:
+        # segment= interpolated: both suggested calls default to 'main', and
+        # step numbers are per-segment, so the bare form reads/writes another
+        # segment in any multi-segment chain.
         out["note"] = (
             f"The best draft of this segment is step {stats['best_step']} "
             f"({stats['best_score']}), which is older than the {len(rows)} step(s) shown. "
-            f"Raise `limit` to see it, chain_get_text(step='best') to read it, or "
-            f"chain_submit(branch_from={stats['best_step']}) to continue from it."
+            f"Raise `limit` to see it, chain_get_text(segment='{segment}', step='best') "
+            f"to read it, or chain_submit(segment='{segment}', "
+            f"branch_from={stats['best_step']}) to continue from it."
         )
     return out
 
@@ -840,12 +1010,19 @@ def chain_get_text(
         Field(description="Step number, or 'best' (lowest score) or 'latest'."),
     ] = "best",
 ) -> dict:
-    """Retrieve the stored text for one step. Use this to resume work after a
-    restart, or to recover a draft that scored better than your current one."""
+    """Retrieve the stored text for one step, byte for byte as it was submitted.
+    Use this to resume work after a restart, or to recover a draft that scored
+    better than your current one."""
     try:
-        store.get(chain_id)
+        known = store.segments_of(chain_id)
     except KeyError as exc:
         return _fail(exc)
+    # Same fix chain_history got: a mistyped segment used to return "no such
+    # step in segment 'intro'", which reads as "the step is gone" -- a dead end
+    # in the documented regression recovery -- rather than "you typed the
+    # segment wrong", with no list of valid names to correct against.
+    if segment not in known:
+        return _fail(KeyError(f"no such segment '{segment}' in this chain; have {known}"))
     if step == "best":
         row = store.best_step(chain_id, segment)
     elif step == "latest":
@@ -864,6 +1041,14 @@ def chain_get_text(
         "words": row["words"],
         "note": row["note"],
         "text": row["text"],
+        # This tool is step one of the recovery procedure the instructions
+        # describe; without a next_action here the second step (branch_from)
+        # lived only in prose the caller may never have seen.
+        "next_action": (
+            f"Revise this text, then chain_submit(segment='{segment}', "
+            f"branch_from={row['step_no']}) so the lineage records what you "
+            f"built on."
+        ),
     }
 
 
@@ -895,7 +1080,18 @@ def chain_assemble(
         if row is None:
             missing.append(s)
             continue
-        parts.append(row["text"])
+        # Strip each part's own edge whitespace: the separator decides what goes
+        # between sections, not whatever blank lines a draft happened to end on.
+        # This is also what keeps the document score stable now that drafts are
+        # stored verbatim. clean_text collapses an indent run to ONE space rather
+        # than dropping it, so a segment whose first line is indented -- a code
+        # block, a nested bullet -- used to reach the model dedented and now
+        # reaches it with a leading space. Measured on the real checkpoint, that
+        # one character moved a 314-word document from 0.4881 to 0.6356. Stripping
+        # here reproduces the pre-change model input exactly (delta +0.0000 across
+        # every fixture and separator tested). Fidelity is chain_get_text's job,
+        # and it still returns the draft byte for byte.
+        parts.append(row["text"].strip())
         per_segment.append(
             {"segment": s, "step": row["step_no"], "score": round(row["score"], 4),
              "words": row["words"]}
@@ -928,6 +1124,16 @@ def chain_assemble(
         "missing_segments": missing,
         "windows": len(windows),
     }
+    # The single most consequential instruction in the server is this tool's
+    # "Done." -- so it carries the same short-text caveat detect and
+    # chain_submit already carry. A 40-word assembled blurb can pass (or fail)
+    # the target on nothing but length noise, and this response used to say
+    # "Done." with no hint of the +/-0.3 spread chain_submit would have
+    # attached to the very same words.
+    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
+    short_note = _short_text_note(verdict.word_count)
+    if short_note:
+        out["reliability_note"] = short_note
     # chain_status calls these segments pending; this tool may simultaneously
     # report the document as finished. Both are true, and a caller given the two
     # answers with nothing to reconcile them either revises text that is already
@@ -944,7 +1150,13 @@ def chain_assemble(
             f"score above covers only the sections that exist."
         )
     elif verdict.score <= target:
-        out["next_action"] = "Document meets target and every segment has a draft. Done."
+        if short_note:
+            out["next_action"] = (
+                f"Document meets target and every segment has a draft -- BUT "
+                f"{short_note} Treat this pass as provisional."
+            )
+        else:
+            out["next_action"] = "Document meets target and every segment has a draft. Done."
         if above:
             out["next_action"] += (
                 f" Segments {above} score above target ON THEIR OWN, and chain_status will "
@@ -953,11 +1165,27 @@ def chain_assemble(
             )
     else:
         worst = max(per_segment, key=lambda p: p["score"])["segment"]
+        # "the assembled text above" only exists when include_text is true;
+        # with it false the instruction pointed at a field not in the response,
+        # and no other tool returns the assembled document.
+        where = (
+            "the assembled text above"
+            if include_text
+            else "the assembled text (re-call chain_assemble with include_text=true to get it)"
+        )
         out["next_action"] = (
             f"Document scores {round(verdict.score, 4)}, above the target {target}. Call "
-            f"detect_spans on the assembled text above to find which passages drive it -- "
+            f"detect_spans on {where} to find which passages drive it -- "
             f"section scores are a poor guide here. Otherwise revise segment "
-            f"'{worst}' with chain_submit and assemble again."
+            f"'{worst}' with chain_submit(segment='{worst}') and assemble again."
+        )
+    if len(segs) == 1:
+        # For a single-segment chain this whole call is a round trip to the
+        # segment's own best score; say so, so a driving agent stops scheduling
+        # assemble passes that cannot tell it anything new.
+        out["note"] = (
+            "Single-segment chain: the assembled score is the segment's best "
+            "score by construction. chain_submit's feedback is all there is."
         )
     if include_text:
         out["text"] = document
@@ -977,11 +1205,28 @@ def chain_list(
 @_guard
 def chain_delete(
     chain_id: Annotated[str, Field(description="Chain to delete permanently.")],
+    segment: Annotated[
+        str | None,
+        Field(description="Delete only this segment (its drafts and its entry in the "
+                          "declared list) instead of the whole chain. The escape hatch "
+                          "for a typo'd segment name, which otherwise marks the chain "
+                          "incomplete forever."),
+    ] = None,
 ) -> dict:
-    """Delete a chain and every step it holds. This cannot be undone."""
+    """Delete a chain and every step it holds -- or, with `segment`, just that
+    segment. Either way this cannot be undone."""
     try:
+        if segment is not None:
+            n = store.delete_segment(chain_id, segment)
+            return {
+                "ok": True,
+                "chain_id": chain_id,
+                "segment": segment,
+                "deleted_steps": n,
+                "remaining_segments": store.segments_of(chain_id),
+            }
         n = store.delete(chain_id)
-    except KeyError as exc:
+    except (KeyError, ValueError) as exc:
         return _fail(exc)
     return {"ok": True, "chain_id": chain_id, "deleted_steps": n}
 

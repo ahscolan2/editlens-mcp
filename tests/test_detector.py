@@ -8,7 +8,15 @@ TMP = Path(tempfile.mkdtemp())
 os.environ["EDITLENS_DB"] = str(TMP / "v.db")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from editlens_mcp.detector import EditLensDetector, clean_text, count_words, pick_device
+from editlens_mcp.detector import (
+    EditLensDetector,
+    _sentence_spans,
+    clean_text,
+    count_words,
+    pick_device,
+    split_units,
+    split_units_adaptive,
+)
 
 import torch  # noqa: E402
 
@@ -28,6 +36,69 @@ TEXTS = [
     "across the inner mitochondrial membrane.",
     "hey are we still on for thursday? i can bring the thing if you want, lmk",
 ]
+
+
+def test_text_pipeline_beyond_english():
+    """The splitter and counter on text the model was not calibrated on.
+
+    All four defects here shipped silently: an unspaced Chinese clause counted
+    as one \\b-word (3-4x undercount, tripping every word-count threshold); a
+    Chinese document had ZERO sentence boundaries because _SENT_END demanded
+    trailing whitespace that CJK never writes; NFD input (macOS, PDF paste)
+    doubled the word count of accented-language text; and a hyphen-bulleted
+    list collapsed to one unit, silently disabling all span feedback on the
+    draft shapes agents write most.
+    """
+    import unicodedata
+
+    # CJK counting: ~2 chars per word-equivalent, nowhere near the clause count.
+    zh = ("人工智能正在改变我们的写作方式。它可以生成流畅的文本，但有时缺乏个性。"
+          "检测工具因此变得重要。")
+    n = count_words(zh)
+    assert 15 <= n <= 35, f"Chinese char-count heuristic off: {n} for {len(zh)} chars"
+
+    # CJK sentence boundaries: 。 needs no trailing whitespace.
+    assert len(_sentence_spans(zh)) == 3, _sentence_spans(zh)
+
+    # NFC/NFD must agree, or the same visible string passes thresholds in one
+    # normalisation form and fails them in the other.
+    vi = "Trí tuệ nhân tạo đang thay đổi cách chúng ta viết văn bản hằng ngày"
+    nfc, nfd = (count_words(unicodedata.normalize(f, vi)) for f in ("NFC", "NFD"))
+    assert nfc == nfd, f"NFC {nfc} != NFD {nfd}"
+
+    # Bullet lists: line-boundary fallback instead of one giant unit.
+    bullets = "\n".join(
+        f"- Step {i} configures the widget and validates the gadget output carefully."
+        for i in range(20)
+    )
+    units = split_units(bullets, "sentence", 1)
+    assert len(units) == 20, f"line fallback failed: {len(units)} units"
+    for (a0, a1), (b0, b1) in zip(units, units[1:]):
+        assert a1 == b0, "line-fallback units must tile"
+    merged, used = split_units_adaptive(bullets, "sentence", 25)
+    assert len(merged) >= 2, "merged bullet units must still be plural"
+
+    # Abbreviations no longer end sentences: one boundary here, not four.
+    ab = "Dr. Chen and Prof. Lima met J. Smith at 3 p.m. to review Vol. 2. It went well."
+    spans = _sentence_spans(ab)
+    assert len(spans) == 2, [ab[a:b] for a, b in spans]
+
+    # ...but the digit rule must stay a LIST-MARKER rule. Its first version
+    # suppressed every "<number>." boundary, so ordinary prose ending in a year
+    # or a price lost its sentence breaks -- the fix mangled English to protect
+    # list formatting.
+    prose_nums = "The study ran until 2024. It found nothing. Costs hit $5. Nobody minded."
+    assert len(_sentence_spans(prose_nums)) == 4, _sentence_spans(prose_nums)
+    lst = ("1. Configure the widget carefully today.\n"
+           "2. Validate the gadget output now.\n3. Ship it.")
+    assert len(split_units(lst, "sentence", 1)) == 3, "list markers must not split"
+
+    # English prose is untouched by all of the above.
+    prose = "One sentence here. Another follows it. A third one closes the set."
+    assert len(_sentence_spans(prose)) == 3
+    assert count_words("plain english words here") == 4
+    print(f"  CJK counts {n} words for {len(zh)} chars and splits into 3 sentences; "
+          f"NFC==NFD; 20-bullet list yields 20 tiled units; abbreviations survive")
 
 
 def test_dtype_defaults():
@@ -331,6 +402,7 @@ def test_unload_waits_for_an_in_flight_request():
 
 
 if __name__ == "__main__":
+    test_text_pipeline_beyond_english()
     test_dtype_defaults()
     worst = test_precision()
     det = EditLensDetector(device=DEVICE)

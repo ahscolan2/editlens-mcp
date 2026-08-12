@@ -20,6 +20,7 @@ from editlens_mcp.detector import (  # noqa: E402
     map_span,
     split_units,
     split_units_adaptive,
+    text_fingerprint,
 )
 
 PY = sys.executable
@@ -68,13 +69,31 @@ async def _spans_from_server():
         spans = (await c.call_tool(
             "detect_spans", {"text": MESSY, "min_words": 1, "top": 50})).data
         cid = (await c.call_tool("chain_create", {"name": "o"})).data["chain_id"]
+        # span_min_words=1 because MESSY's sentences are short: at the default of
+        # 25 they merge into a single unit, _worst_spans returns nothing, and
+        # every per-span assertion below passes vacuously.
         sub = (await c.call_tool(
-            "chain_submit", {"chain_id": cid, "text": MESSY})).data
-        return spans, sub
+            "chain_submit", {"chain_id": cid, "text": MESSY, "span_min_words": 1})).data
+        # The string the caller can actually get back -- the one it has to splice
+        # the offsets into.
+        got = (await c.call_tool(
+            "chain_get_text", {"chain_id": cid, "step": "latest"})).data
+        return spans, sub, got
+
+
+_SERVER_RESULT = None
+
+
+def _server_result():
+    """One subprocess for both server tests: each launch reloads the model."""
+    global _SERVER_RESULT
+    if _SERVER_RESULT is None:
+        _SERVER_RESULT = asyncio.run(_spans_from_server())
+    return _SERVER_RESULT
 
 
 def test_server_offsets_index_original():
-    spans, sub = asyncio.run(_spans_from_server())
+    spans, sub, _ = _server_result()
     assert spans["ok"], spans
 
     bad = []
@@ -95,6 +114,45 @@ def test_server_offsets_index_original():
             wbad.append(u)
     print(f"  chain_submit: {len(sub.get('worst_spans', []))} spans, {len(wbad)} misaligned")
     assert not wbad, f"{len(wbad)} worst_spans misaligned"
+
+
+def test_stored_draft_is_the_text_the_caller_sent():
+    """chain_get_text must hand back the submitted document unchanged.
+
+    The store used to hold clean_text(text), which collapses every run of spaces
+    to one -- flattening markdown nesting, code indentation and table alignment,
+    and collapsing every indent level to the SAME single space, so the nesting
+    could not be reconstructed from what came back.
+
+    It also made the offsets and source_fingerprint in the very same
+    chain_submit response describe a string no tool would return: they are
+    computed against the raw text, so a client that retrieved its draft and
+    spliced a rewrite at them cut across sentence boundaries. Nothing caught it
+    because no test ever sliced chain_get_text's output at those offsets --
+    they were only ever checked against the fixture the test itself submitted.
+    """
+    _, sub, got = _server_result()
+    assert got["ok"], got
+    assert got["text"] == MESSY, (
+        f"stored draft is not what was submitted: {len(got['text'])} chars back "
+        f"vs {len(MESSY)} sent"
+    )
+
+    spans = sub.get("worst_spans", [])
+    assert spans, "no spans returned -- the checks below would pass vacuously"
+    for u in spans:
+        assert got["text"][u["start"]:u["end"]].split() == u["text"].split(), (
+            f"span [{u['start']}:{u['end']}] does not index the retrieved draft: "
+            f"{got['text'][u['start']:u['end']]!r} vs {u['text']!r}"
+        )
+
+    # The fingerprint has to be reproducible from that same retrieved string, or
+    # a client cannot tell stale offsets from current ones.
+    assert text_fingerprint(got["text"]) == sub["source_fingerprint"], (
+        f"{text_fingerprint(got['text'])} != {sub['source_fingerprint']}"
+    )
+    print(f"  stored draft round-trips exactly ({len(MESSY)} chars); "
+          f"{len(spans)} spans index it; fingerprint matches")
 
 
 def test_spans_tile_the_original_exactly():
@@ -280,4 +338,5 @@ if __name__ == "__main__":
     test_map_span_refuses_impossible_spans()
     test_clean_text_offsets_unchanged_when_text_is_already_clean()
     test_server_offsets_index_original()
+    test_stored_draft_is_the_text_the_caller_sent()
     print("OFFSET TESTS PASSED")

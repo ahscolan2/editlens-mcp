@@ -29,14 +29,21 @@ def default_db_path() -> Path:
     """Per-platform application-data location for the chain database."""
     override = os.environ.get("EDITLENS_DB")
     if override:
-        return Path(override)
+        # MCP client configs are JSON, not a shell: nothing else ever expands
+        # `~` or `$HOME`. Taken verbatim, "~/foo.db" creates a directory
+        # literally named `~` under whatever cwd the launcher happened to give
+        # us, and the chains silently accumulate wherever that was -- a new
+        # location per launcher. Expand, then resolve, so the path means one
+        # place on disk regardless of who started the process.
+        # expandvars first: "$HOME/foo" and "%LOCALAPPDATA%\\foo" both work.
+        return Path(os.path.expandvars(override)).expanduser().resolve()
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return base / "editlens-mcp" / "chains.db"
+    return (base.expanduser() / "editlens-mcp" / "chains.db").resolve()
 
 
 DEFAULT_DB = default_db_path()
@@ -256,19 +263,43 @@ class ChainStore:
             """,
             (limit,),
         )
-        return [
-            {
+        # Per-segment bests in one query, merged in Python. `best_score` alone
+        # misled: MIN across ALL segments, so a chain with a 0.90 intro and a
+        # 0.05 body listed as 0.05 and read as finished. The honest signals are
+        # how many declared segments have a draft at target -- counted against
+        # the DECLARED list, so an unstarted segment counts as not-at-target
+        # rather than silently dropping out of the arithmetic.
+        seg_rows = self._read(
+            "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
+            " GROUP BY chain_id, segment",
+            (),
+        )
+        seg_best: dict[str, dict[str, float]] = {}
+        for r in seg_rows:
+            seg_best.setdefault(r["chain_id"], {})[r["segment"]] = r["seg_best"]
+        out = []
+        for r in rows:
+            declared = json.loads(r["segments"])
+            bests = seg_best.get(r["id"], {})
+            target = float(r["target_score"])
+            at_target = sum(
+                1 for s in declared if s in bests and bests[s] <= target
+            )
+            out.append({
                 "chain_id": r["id"],
                 "name": r["name"],
                 "goal": r["goal"],
                 "target_score": r["target_score"],
-                "segments": json.loads(r["segments"]),
+                "segments": declared,
                 "steps": r["steps"],
+                # Lowest step score anywhere in the chain -- NOT the document
+                # score and NOT "every segment passed"; see the two fields below.
                 "best_score": round(r["best"], 4) if r["best"] is not None else None,
+                "segments_at_target": at_target,
+                "segments_total": len(declared),
                 "updated_at": r["updated_at"],
-            }
-            for r in rows
-        ]
+            })
+        return out
 
     def delete(self, chain_id: str) -> int:
         with self._write() as conn:
@@ -276,6 +307,44 @@ class ChainStore:
                 raise KeyError(f"no such chain: {chain_id}")
             n = conn.execute("DELETE FROM steps WHERE chain_id = ?", (chain_id,)).rowcount
             conn.execute("DELETE FROM chains WHERE id = ?", (chain_id,))
+        return n
+
+    def delete_segment(self, chain_id: str, segment: str) -> int:
+        """Remove one segment: its steps and its entry in the declared list.
+
+        The escape hatch for a typo'd segment name. Without it, one mistyped
+        `segment=` on chain_submit registers a phantom segment that makes
+        chain_assemble report the chain incomplete forever, and the only way
+        out was deleting the whole chain. Steps and the declared list must
+        change in ONE transaction -- removing the entry first would orphan the
+        steps out of status/assembly while they still exist, and removing the
+        steps first would leave the phantom on a crash between the two.
+        """
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT segments FROM chains WHERE id = ?", (chain_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"no such chain: {chain_id}")
+            segs = json.loads(row["segments"])
+            if segment not in segs:
+                raise KeyError(
+                    f"no such segment '{segment}' in this chain; have {segs}"
+                )
+            if len(segs) == 1:
+                raise ValueError(
+                    "cannot delete the only segment; use chain_delete on the "
+                    "whole chain instead"
+                )
+            segs.remove(segment)
+            n = conn.execute(
+                "DELETE FROM steps WHERE chain_id = ? AND segment = ?",
+                (chain_id, segment),
+            ).rowcount
+            conn.execute(
+                "UPDATE chains SET segments = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(segs), time.time(), chain_id),
+            )
         return n
 
     def add_segment(self, chain_id: str, segment: str) -> list[str]:
@@ -319,7 +388,9 @@ class ChainStore:
         probs: list[float],
         note: str | None = None,
         parent_step: int | None = None,
-    ) -> int:
+        register_segment: bool = False,
+        with_lineage: bool = False,
+    ) -> int | tuple[int, sqlite3.Row | None, sqlite3.Row | None]:
         """Allocate the next step number and insert, atomically.
 
         `parent_step` records which draft this one was derived from. History is
@@ -330,6 +401,23 @@ class ChainStore:
         The MAX(step_no) read and the INSERT must share one transaction, or two
         concurrent submits both read N and both write N+1 -- after which
         chain_get_text(step=N+1) returns an arbitrary one of the two drafts.
+
+        `register_segment` adds the segment to the chain's declared list in the
+        SAME transaction as the insert. Registering in a separate call first
+        meant a failed insert (a "database is locked" timeout, say) left a
+        declared segment with zero steps -- a phantom that chain_assemble
+        reports as incomplete forever.
+
+        `with_lineage=True` returns (step_no, prev_latest, prev_best), both read
+        inside this transaction just before the insert. The caller's own
+        pre-scoring reads are seconds stale by insert time: under concurrent
+        submits every racer computed is_new_best/best_step from the same empty
+        snapshot and each declared ITSELF the best, steering the caller onto a
+        worse draft. parent_step deliberately does NOT switch to the
+        in-transaction latest -- the parent is the draft the caller was actually
+        revising, which is the one it read before scoring; stamping a racer's
+        draft as the parent would fabricate lineage between drafts written
+        independently.
         """
         now = time.time()
         attempts = 0
@@ -337,6 +425,31 @@ class ChainStore:
             attempts += 1
             try:
                 with self._write() as conn:
+                    if register_segment:
+                        row = conn.execute(
+                            "SELECT segments FROM chains WHERE id = ?", (chain_id,)
+                        ).fetchone()
+                        if row is None:
+                            raise KeyError(f"no such chain: {chain_id}")
+                        segs = json.loads(row["segments"])
+                        if segment not in segs:
+                            segs.append(segment)
+                            conn.execute(
+                                "UPDATE chains SET segments = ? WHERE id = ?",
+                                (json.dumps(segs), chain_id),
+                            )
+                    prev_latest = prev_best = None
+                    if with_lineage:
+                        prev_latest = conn.execute(
+                            "SELECT * FROM steps WHERE chain_id = ? AND segment = ?"
+                            " ORDER BY step_no DESC LIMIT 1",
+                            (chain_id, segment),
+                        ).fetchone()
+                        prev_best = conn.execute(
+                            "SELECT * FROM steps WHERE chain_id = ? AND segment = ?"
+                            " ORDER BY score ASC, step_no ASC LIMIT 1",
+                            (chain_id, segment),
+                        ).fetchone()
                     row = conn.execute(
                         "SELECT COALESCE(MAX(step_no), 0) AS n FROM steps"
                         " WHERE chain_id = ? AND segment = ?",
@@ -354,6 +467,8 @@ class ChainStore:
                     conn.execute(
                         "UPDATE chains SET updated_at = ? WHERE id = ?", (now, chain_id)
                     )
+                if with_lineage:
+                    return step_no, prev_latest, prev_best
                 return step_no
             except sqlite3.IntegrityError as exc:
                 # Only a UNIQUE collision is worth retrying: another process
@@ -419,5 +534,11 @@ class ChainStore:
             "best_score": round(best["score"], 4) if best else None,
             "latest_step": latest["step_no"] if latest else None,
             "latest_score": round(latest["score"], 4) if latest else None,
-            "words": latest["words"] if latest else 0,
+            # `words` is the BEST draft's count -- the draft assembly will use --
+            # so it agrees with chain_assemble's per_segment.words. It used to be
+            # the latest draft's count sitting beside the best draft's score,
+            # which paired a number with a score describing a different text.
+            "words": best["words"] if best else 0,
+            "best_words": best["words"] if best else 0,
+            "latest_words": latest["words"] if latest else 0,
         }

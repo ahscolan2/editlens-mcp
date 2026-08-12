@@ -52,6 +52,62 @@ def test_parallel_add_step():
     store.close()
 
 
+def test_lineage_read_inside_the_insert_transaction():
+    """with_lineage returns the state the insert actually landed on.
+
+    chain_submit used to read latest/best BEFORE scoring -- a window of seconds
+    -- and compute is_new_best/best_step from that stale snapshot. 12 racing
+    submits each saw an empty segment, so each reported is_new_best=true and
+    best_step=<itself>, steering the caller onto the worst draft. The reads now
+    live inside add_step's BEGIN IMMEDIATE, where they see every draft
+    committed before this one.
+    """
+    store = ChainStore(TMP / "lineage.db")
+    cid = store.create("x", segments=["main"])["chain_id"]
+    results, errors = [], []
+    barrier = threading.Barrier(8)
+
+    def worker(k):
+        try:
+            barrier.wait()
+            step_no, prev_latest, prev_best = store.add_step(
+                cid, "main", f"racer {k}", 0.5 + k * 0.01, 2, "x", 10,
+                [0.25] * 4, with_lineage=True)
+            results.append((step_no, prev_latest, prev_best))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(k,)) for k in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors, errors[:3]
+    assert len(results) == 8
+
+    # Exactly ONE racer may see an empty segment (the one whose transaction ran
+    # first). Every other one must see at least the first insert -- the stale
+    # pre-scoring read used to hand all 8 a None.
+    empty = [r for r in results if r[1] is None]
+    assert len(empty) == 1, f"{len(empty)} racers saw an empty segment; only the first may"
+    # And each racer's view must be consistent with its own step number: the
+    # latest it saw is the step numbered immediately before its own.
+    for step_no, prev_latest, prev_best in results:
+        if prev_latest is not None:
+            assert prev_latest["step_no"] == step_no - 1, (
+                step_no, prev_latest["step_no"])
+            assert prev_best is not None
+    print("  8 racing add_steps: 1 first insert saw None, 7 saw their true "
+          "predecessor (stale snapshot would have handed all 8 a None)")
+
+    # register_segment: the declared list and the insert commit together.
+    step_no, prev_latest, prev_best = store.add_step(
+        cid, "newseg", "first draft", 0.4, 2, "x", 10, [0.25] * 4,
+        register_segment=True, with_lineage=True)
+    assert step_no == 1 and prev_latest is None
+    assert "newseg" in store.segments_of(cid)
+    print("  register_segment commits the declared list with the insert")
+    store.close()
+
+
 def test_parallel_add_segment():
     """Concurrent add_segment must not lose names to a read-modify-write race."""
     store = ChainStore(TMP / "seg.db")
@@ -158,6 +214,7 @@ def test_delete_isolated_from_insert():
 if __name__ == "__main__":
     print("concurrency tests")
     test_parallel_add_step()
+    test_lineage_read_inside_the_insert_transaction()
     test_parallel_add_segment()
     test_two_processes_share_db()
     test_unique_index_enforced()

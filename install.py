@@ -1,6 +1,6 @@
-"""Cross-platform setup helper.
+"""Cross-platform install helper.
 
-    python setup.py
+    python install.py
 
 Installs the right PyTorch for this machine, then the remaining dependencies,
 then checks Hugging Face access to the gated checkpoint and prints the exact
@@ -78,6 +78,20 @@ def client_config() -> str:
 
 
 def main() -> int:
+    # Before spending bandwidth: the server needs 3.10+ (runtime `int | Literal`
+    # unions in tool signatures). Without this check, an old python downloads
+    # ~2.5 GB of torch successfully and THEN dies on fastmcp with an error that
+    # names fastmcp, not Python -- undiagnosable for a non-Python developer.
+    # macOS system python3 is still 3.9 on many installs, so this is the first
+    # thing a Mac user would have hit.
+    if sys.version_info < (3, 10):
+        print(
+            f"EditLens MCP needs Python 3.10 or newer; this is "
+            f"{sys.version.split()[0]} ({sys.executable}).\n"
+            f"Install a newer Python (e.g. from python.org or `brew install "
+            f"python`) and re-run this script with it."
+        )
+        return 1
     print(f"EditLens MCP setup — {sys.platform}, Python {sys.version.split()[0]}")
     print(f"Project: {ROOT}")
 

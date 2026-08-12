@@ -2,7 +2,7 @@
 
 Launch with an absolute path and no working-directory assumption:
 
-    python /path/to/MCP-EditLens/run_server.py
+    python /path/to/editlens-mcp/run_server.py
 
 This exists because MCP clients differ in whether they honour a `cwd` setting,
 and `python -m editlens_mcp.server` silently fails without one.

@@ -13,12 +13,15 @@ from fastmcp.client.transports import StdioTransport
 
 
 async def main():
+    workdir = tempfile.mkdtemp()
     env = dict(os.environ)
-    env["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "sub.db")
-    # Launch from an unrelated cwd: clients rarely set one.
+    env["EDITLENS_DB"] = str(Path(workdir) / "sub.db")
+    # Launch from an unrelated cwd: clients rarely set one. It must not be the repo
+    # root, or the server would import editlens_mcp from cwd and hide a packaging bug.
+    # A temp dir is unrelated on every platform; a hardcoded one is not.
     env.pop("PYTHONPATH", None)
 
-    transport = StdioTransport(command=PY, args=[SCRIPT], env=env, cwd="C:\\Windows")
+    transport = StdioTransport(command=PY, args=[SCRIPT], env=env, cwd=workdir)
     async with Client(transport) as c:
         tools = sorted(t.name for t in await c.list_tools())
         print(f"connected. {len(tools)} tools: {', '.join(tools)}")
