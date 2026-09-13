@@ -8,6 +8,7 @@ in its context window.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -19,6 +20,7 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from .chains import ChainStore, default_db_path
+from .guidance import SCORE_NOTE, SPAN_NOTE, TARGET_NOTE, length_assessment, revision_progress, submission_advice
 from .detector import (
     DetectorUnavailable,
     EditLensDetector,
@@ -33,22 +35,17 @@ from .detector import (
 mcp = FastMCP(
     name="editlens",
     instructions=(
-        "Local AI-text detector (pangram/editlens_roberta-large). `detect` scores one text "
-        "0.0 (human-written) to 1.0 (fully AI-generated). `detect_spans` shows which sentences "
-        "drive that score. For iterative work, open a chain with `chain_create`, then call "
-        "`chain_submit` after every draft: it stores the text on disk and returns only the score "
-        "delta plus the worst spans, so a chain can run for hundreds of steps cheaply. "
-        "Use `chain_assemble` to score the concatenation of a multi-section chain. "
-        "chain_create, chain_submit, chain_status, chain_get_text and chain_assemble return "
-        "a `next_action` -- follow it rather than inferring a plan "
-        "from the scores, because two things about those scores are counter-intuitive. "
-        "First, scores are not comparable across lengths: the model scores a sentence or a "
-        "section harder than the same words inside a whole document, so parts routinely score "
-        "far above the document they compose, and the document score is the one that decides "
-        "whether you are finished. Second, chain history is append-only and nothing is ever "
-        "overwritten, so when a revision scores worse the fix is to go back -- "
-        "`chain_get_text(step='best')` to read the better draft, then `chain_submit` with "
-        "`branch_from` set to that step -- not to keep editing the worse one."
+        "Local document-level estimate of AI editing magnitude. Scores are not probabilities "
+        "of AI authorship or writing-quality scores. detect_spans scores fragments independently; "
+        "it does not explain the document score. Scores are not comparable across lengths. "
+        "Use next_action for workflow context, but preserve meaning, facts, and voice over a "
+        "lower number. Do not rewrite short text solely to move its score. A chain stores drafts "
+        "durably; best means lowest-scoring, not best writing. Use chain_get_text and branch_from "
+        "to inspect earlier drafts. Stop score-driven loops when stop_recommended is true; "
+        "you may still save further revisions. A configured target is not a calibrated boundary. "
+        "Score complete documents and assemble multi-section drafts before considering revisions. "
+        "Independent MCP sessions share one local inference worker by default. Requests queue; "
+        "prefer detect_batch to many separate calls. The first scoring call loads the checkpoint."
     ),
 )
 
@@ -67,7 +64,10 @@ def _env_number(name: str, default, cast):
     if raw is None or not raw.strip():
         return default
     try:
-        return cast(raw)
+        value = cast(raw)
+        if not math.isfinite(value):
+            raise ValueError
+        return value
     except (TypeError, ValueError):
         print(
             f"[editlens] warning: ignoring {name}={raw!r} (not a number); using {default}",
@@ -76,12 +76,17 @@ def _env_number(name: str, default, cast):
         return default
 
 
-detector = EditLensDetector(
+DETECTOR_CONFIG = dict(
     device=os.environ.get("EDITLENS_DEVICE") or None,
     batch_size=_env_number("EDITLENS_BATCH_SIZE", 8, int),
     dtype=os.environ.get("EDITLENS_DTYPE") or None,
     idle_unload_seconds=_env_number("EDITLENS_IDLE_UNLOAD", 300.0, float),
+    preprocessing=os.environ.get("EDITLENS_PREPROCESS") or "reference",
 )
+# Direct Python use remains in-process. main() replaces this configuration-only
+# object with the shared adapter before accepting any MCP request.
+detector = EditLensDetector(**DETECTOR_CONFIG)
+
 # default_db_path() re-reads EDITLENS_DB and treats an empty value as unset.
 # Passing os.environ.get(...) here instead handed it "" and crashed at import.
 #
@@ -89,9 +94,8 @@ detector = EditLensDetector(
 # was the only statement in the file outside _guard's protection: an unwritable
 # directory, a path component that is a file, or a chains.db that arrived
 # half-copied ("file is not a database") killed the process before FastMCP
-# registered a single tool -- including detector_info, whose docstring says to
-# call it first when things break. Now the 12 chain/detect tools fail per-call
-# with the real reason, and detector_info stays alive to report it.
+# registered a single tool. Chain tools now fail per-call, scoring stays usable,
+# and detector_info reports the database error.
 class _BrokenStore:
     """Stands in for ChainStore when the database could not be opened.
 
@@ -109,14 +113,15 @@ class _BrokenStore:
 
 
 def _open_store():
-    path = default_db_path()
+    path = None
     try:
+        path = default_db_path()
         return ChainStore(path), None
     except Exception as exc:  # noqa: BLE001 - import-time boundary
         msg = (
             f"chain store failed to open: {type(exc).__name__}: {exc} "
             f"(EDITLENS_DB={os.environ.get('EDITLENS_DB')!r} resolved to '{path}'). "
-            f"detect/detect_batch/detect_spans and the chain tools need this "
+            f"Only the chain tools need this "
             f"database; fix the path and restart the server."
         )
         print(f"[editlens] warning: {msg}", file=sys.stderr)
@@ -128,53 +133,41 @@ store, STORE_ERROR = _open_store()
 MAX_SPAN_REPORT = 5
 # Merge threshold for span feedback, matching detect_spans' own default.
 SPAN_MIN_WORDS = 25
-# Below this the model's score is indicative rather than precise.
-RELIABLE_WORDS = 25
-# ...and below this it is still noisy enough to be worth a second opinion.
-# Measured by cutting five known-human passages to fixed lengths and scoring
-# each prefix: the spread across those five texts was 0.30 at 10 words, 0.63 at
-# 15, 0.37 at 20, then 0.24 at 30, 0.19 at 40, 0.12 at 50 and 0.06 by 60. One of
-# the five crossed a 0.25 target on nothing but length. So a score on a short
-# draft is not evidence that the draft needs rewriting.
-NOISY_WORDS = 60
-# How much worse than the best draft counts as a regression worth recovering
-# from, rather than run-to-run noise.
+# Compatibility flag: this is only a length check, not calibrated confidence.
+RELIABLE_WORDS = 75
+# Workflow heuristic for pointing out a higher score; not a noise estimate.
 REGRESSION_DELTA = 0.05
 
-# The detector is a document-level classifier, and it scores short text harder
-# than the same prose inside a longer document. Both directions were observed
-# driving this server for real: a 96-word paragraph scored 0.299 while every one
-# of its sentence-groups scored 0.20 or below, and a four-section report
-# assembled to 0.108 from sections scoring up to 0.733. So a caller cannot
-# compare a fragment's score to a document's, and every place this server hands
-# back both numbers has to say which one decides.
-SCALE_NOTE = (
-    "Scores are not comparable across lengths: the model scores short fragments "
-    "harder than the same words inside a full document."
-)
+SCALE_NOTE = SPAN_NOTE
 
 
 def _short_text_note(words: int) -> str | None:
-    """The caveat that belongs on any score computed from very little text.
-
-    Genuinely human passages cut to 15 words scored anywhere from 0.06 to 0.69
-    on this model. A caller handed 0.46 for a 26-word note, with no indication
-    of that spread, rewrites prose that was never the problem.
-    """
-    if words >= NOISY_WORDS:
+    if words >= 75:
         return None
-    if words < RELIABLE_WORDS:
-        return (
-            f"Only {words} words: below ~{RELIABLE_WORDS} this score is indicative, not a "
-            f"measurement -- known-human passages this short have scored anywhere from "
-            f"0.02 to 0.69. Do not rewrite prose to move it. Score the text in its full "
-            f"context instead."
-        )
     return (
-        f"Only {words} words: under ~{NOISY_WORDS} this score is noisy (human passages of "
-        f"this length vary by ~0.2 on nothing but length). Prefer the score of the whole "
-        f"document over this one."
+        f"Only {words} words: below the reference training floor of 75 words. "
+        "This is an uncalibrated estimate, not a measurement of authorship. "
+        "Do not rewrite prose to move it; review the full document when available."
     )
+
+
+def _scoring_profile() -> dict:
+    return detector.scoring_identity()
+
+
+def _check_chain_profile(chain) -> None:
+    saved = json.loads(chain["meta"] or "{}").get("scoring_profile")
+    current = _scoring_profile()
+    if saved is None and current["preprocessing"] == "legacy":
+        return  # pre-profile chains used the whitespace-only scoring path
+    if saved != current:
+        raise ValueError(
+            "This chain was scored with a different or legacy scoring profile. "
+            "Saved drafts remain available through chain_get_text/history. "
+            "Create a new chain and resubmit a chosen draft to use current scoring, "
+            "or use EDITLENS_PREPROCESS=legacy for an older whitespace-only chain. "
+            "Scores from different pipelines must not be ranked together."
+        )
 
 
 def _fail(exc: Exception) -> dict:
@@ -214,11 +207,8 @@ def _worst_spans(
     `start`/`end` index the caller's ORIGINAL text, not the normalised copy the
     model sees -- offsets you cannot splice against are worse than no offsets.
 
-    `above_target` marks the spans actually worth rewriting. Without it the
-    caller sees five spans under a heading that says "worst" and rewrites all
-    five -- including ones the same response labels Human-written, which is how
-    a revision loop makes a draft worse while believing it is following
-    instructions.
+    `above_target` is only a numerical comparison. An isolated fragment score
+    does not identify a writing defect or establish sentence provenance.
 
     The second return value describes the WHOLE text, not the `top` slice of it.
     Reporting only the slice is how a caller ends up being told that 31 units it
@@ -242,9 +232,11 @@ def _worst_spans(
             "score": round(v.score, 4),
             "label": v.label,
             "words": v.word_count,
+            "model_word_count": v.model_word_count if v.model_word_count is not None else v.word_count,
+            "assessment_word_count": v.assessment_word_count,
             # The same per-unit caveat detect_spans already carries. A 9-word
             # unit scored 0.99 is not the same evidence as a 40-word one.
-            "reliable": v.word_count >= RELIABLE_WORDS,
+            "reliable": v.assessment_word_count >= RELIABLE_WORDS,
             "text": source[a:b],
         }
         if target is not None:
@@ -268,9 +260,12 @@ def detector_info() -> dict:
     # "ok" on the success path too: _guard supplies it on failure, and a client
     # branching on result["ok"] should not KeyError when nothing went wrong.
     info = {"ok": True, **detector.info()}
+    info.setdefault("backend", "local")
+    info["score_note"] = SCORE_NOTE
+    info["reliability_basis"] = "Length only (75-word training floor); not calibrated confidence."
     # Resolved, not the configured string: a relative EDITLENS_DB used to be
     # echoed back verbatim ("chains.db"), which names no location on disk.
-    info["db_path"] = str(Path(store.path).resolve())
+    info["db_path"] = str(Path(store.path).resolve()) if store.path is not None else None
     info["db_path_configured"] = os.environ.get("EDITLENS_DB")
     if STORE_ERROR is not None:
         # This tool's whole job is answering "why is everything broken?" --
@@ -311,10 +306,10 @@ def detect(
         bool, Field(description="Also return per-window scores for long inputs.")
     ] = False,
 ) -> dict:
-    """Score one text for AI authorship.
+    """Estimate the extent of AI editing in one document.
 
-    Returns `score` in [0,1] -- 0.0 = human-written, 1.0 = fully AI-generated --
-    along with the discrete bucket label and the full probability distribution.
+    Returns expected bucket index scaled to [0,1], the most probable bucket,
+    and the probability distribution. These are uncalibrated model estimates.
     Inputs longer than the model's 512-token window are split into overlapping
     windows and combined by word-count-weighted average.
     """
@@ -322,17 +317,20 @@ def detect(
         source, ranges = clean_text_with_map(text)
         if not source.strip():
             return _fail(ValueError("empty text"))
-        verdict, windows = detector.detect(source, normalise=False)
+        verdict, windows = detector.detect(text)
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
     out: dict[str, Any] = {"ok": True, **verdict.as_dict()}
-    out["target_hint"] = "lower is more human-like"
+    out["target_hint"] = "lower estimates less AI editing; it does not measure writing quality"
+    out["score_note"] = SCORE_NOTE
+    out["scoring_profile"] = _scoring_profile()
+    out.update(length_assessment(verdict.assessment_word_count))
     # detect_spans has flagged short units as unreliable since it was written;
     # `detect` reported a bare 4-decimal score for a 26-word input and said
     # nothing. That is the number a caller acts on, so it is the one that most
     # needs the caveat.
-    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
-    note = _short_text_note(verdict.word_count)
+    out["reliable"] = verdict.assessment_word_count >= RELIABLE_WORDS
+    note = _short_text_note(verdict.assessment_word_count)
     if note:
         out["reliability_note"] = note
     if include_windows and len(windows) > 1:
@@ -352,16 +350,9 @@ def detect(
 def detect_batch(
     texts: Annotated[list[str], Field(description="Texts to score in a single pass.")],
 ) -> dict:
-    """Score many texts at once in one batched forward pass.
-
-    Use this to compare candidate drafts side by side -- generate N variants,
-    score them together, keep the lowest.
-
-    Treat these scores as a RANKING, not as a verdict. When the candidates are
-    sentences or sections rather than whole documents, all of them will score
-    higher than the document they end up in, so do not discard a whole batch for
-    missing a document-level target -- pick the lowest, splice it in, and score
-    the result with `detect`.
+    """Score candidate documents together. best_index means lowest detector
+    score, not best writing. Compare similar-length revisions of the same full
+    document, review quality independently, and inspect each length assessment.
     """
     if not texts:
         return _fail(ValueError("texts is empty"))
@@ -369,20 +360,26 @@ def detect_batch(
         verdicts = detector.detect_many(texts)
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
-    results = [{"index": i, **v.as_dict()} for i, v in enumerate(verdicts)]
-    best = min(results, key=lambda r: r["score"])
+    results = [{"index": i, **v.as_dict(), **length_assessment(v.assessment_word_count),
+                "reliable": v.assessment_word_count >= RELIABLE_WORDS,
+                **({"reliability_note": _short_text_note(v.assessment_word_count)} if v.assessment_word_count < 75 else {})}
+               for i, v in enumerate(verdicts)]
+    best_index = min(range(len(verdicts)), key=lambda i: verdicts[i].score)
+    best = results[best_index]
     return {
         "ok": True,
         "results": results,
         "best_index": best["index"],
+        "score_note": SCORE_NOTE,
+        "scoring_profile": _scoring_profile(),
         "best_score": best["score"],
         "mean_score": round(sum(r["score"] for r in results) / len(results), 4),
         # Observed: three candidate paragraphs scored 0.50/0.99/0.66, and the
         # best one spliced into its document took that document to 0.06. A
         # caller comparing best_score against its target rejects all three.
         "comparison_note": (
-            f"Use these to rank the candidates against each other. {SCALE_NOTE} "
-            f"Re-score with `detect` after splicing the winner in."
+            f"This ranking is only by detector score, not writing quality. Compare similar-length "
+            f"versions of the same complete document. {SCALE_NOTE}"
         ),
     }
 
@@ -399,18 +396,12 @@ def detect_spans(
         int, Field(description="Merge sentences until a unit reaches this many words.", ge=1, le=200)
     ] = 25,
 ) -> dict:
-    """Localise the score: split the text and score each unit separately.
+    """Score sentence groups or paragraphs independently, sorted highest first.
 
-    Returns units sorted worst-first, so you know which passages to rewrite
-    rather than redrafting the whole thing. Short sentences are merged toward
-    `min_words` because the model is unreliable on very short inputs; if that
-    would leave the whole text as one unit, the threshold is relaxed
-    automatically and `min_words_used` reports what it settled on. Treat units
-    under ~25 words as indicative rather than precise.
-
-    `start`/`end` are offsets into the text YOU passed in, so you can splice a
-    rewrite straight back. `text` is the normalised form the model scored
-    (whitespace collapsed), which may differ from that slice.
+    These fragment scores do not explain the document score or identify text
+    that must be rewritten. Units shorter than the 75-word training floor are
+    flagged. start/end index your original text; text is display-normalized.
+    The model applies the reported scoring_profile to each unit independently.
     """
     try:
         source, imap = clean_text_with_map(text)
@@ -420,7 +411,7 @@ def detect_spans(
         if not units:
             return _fail(ValueError("no scoreable units"))
         verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
-        overall, _ = detector.detect(source, normalise=False)
+        overall, _ = detector.detect(text)
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
 
@@ -435,10 +426,10 @@ def detect_spans(
                 "score": round(v.score, 4),
                 "label": v.label,
                 "words": v.word_count,
-                # The model is a document-level classifier; below ~25 words its
-                # score is indicative at best. Say so per unit rather than
-                # letting a 1-word paragraph look as solid as a paragraph.
-                "reliable": v.word_count >= RELIABLE_WORDS,
+                "model_word_count": v.model_word_count if v.model_word_count is not None else v.word_count,
+                "assessment_word_count": v.assessment_word_count,
+                # Length check only; fragment estimates remain uncalibrated.
+                "reliable": v.assessment_word_count >= RELIABLE_WORDS,
                 "text": source[a:b],
             }
         )
@@ -465,6 +456,10 @@ def detect_spans(
         out["min_words_used"] = None
         out["granularity_relaxed"] = False
     out["unreliable_units"] = sum(1 for r in rows if not r["reliable"])
+    out["analysis_note"] = SPAN_NOTE
+    out["score_note"] = SCORE_NOTE
+    out["scoring_profile"] = _scoring_profile()
+    out.update(length_assessment(overall.assessment_word_count))
     return out
 
 
@@ -491,13 +486,16 @@ def chain_create(
     composing a long document section by section.
     """
     try:
-        created = store.create(name, target_score, goal, segments)
+        created = store.create(name, target_score, goal, segments,
+                               meta={"scoring_profile": _scoring_profile()})
     except Exception as exc:  # noqa: BLE001
         return _fail(exc)
     first = created["segments"][0] if created.get("segments") else "main"
     return {
         "ok": True,
         **created,
+        "scoring_profile": _scoring_profile(),
+        "target_note": TARGET_NOTE,
         "next_action": (
             f"Draft segment '{first}' and call chain_submit(segment='{first}')."
         ),
@@ -532,35 +530,18 @@ def chain_submit(
                           "alternative from an earlier draft instead of the latest one."),
     ] = None,
 ) -> dict:
-    """Submit a draft: score it, score its parts, store it, and say what to do next.
+    """Score and save a draft verbatim, returning compact workflow feedback.
 
-    The response is deliberately compact -- score, movement against the previous
-    and best steps, target status, and the worst spans. The draft text itself is
-    kept on disk, not echoed back, so you can iterate indefinitely.
-
-    Read `next_action` first; it accounts for the cases that are easy to get
-    wrong. Rewrite only spans marked `above_target` -- the list is worst-first,
-    not a to-do list, and its tail is often text that is already fine. But check
-    `spans_truncated`: `worst_spans` holds at most `span_top` entries, and
-    `spans_above_target_total` counts every unit above target, including the ones
-    not shown. History is append-only, so a draft that scores worse costs you
-    nothing: `best_step` names the best draft, `chain_get_text` retrieves it and
-    `branch_from` continues from it.
-
-    On a draft of more than a few hundred words, tune `span_min_words`. It sets
-    how much text each span covers, which is how much text you have to rewrite to
-    act on one. Driving a 1548-word document to a 0.25 target took 4 rounds and
-    rewrote 56% of it at the default 25; at `span_min_words=15` the same loop
-    took 2 rounds and rewrote 15%. Smaller spans score more noisily -- `reliable`
-    is false below ~25 words -- but they let you replace the sentences that
-    actually score badly instead of the paragraphs containing them.
-
-    Span scores and the document score are not on one scale -- short fragments
-    score higher than the same words in a full document -- so the spans can all
-    sit below target while the document stays above it.
+    best_step means lowest detector score; review writing quality independently.
+    Span scores are exploratory comparisons, not document attribution or rewrite
+    instructions. next_action and stop_recommended flag short text, regressions,
+    unchanged drafts, plateaus and an eight-submission review point. These are
+    advisory; every valid submission is stored. branch_from records an earlier
+    draft as the parent. Never mix scoring profiles within one chain.
     """
     try:
         chain = store.get(chain_id)
+        _check_chain_profile(chain)
         segs = json.loads(chain["segments"])
         is_new_segment = segment not in segs
 
@@ -604,7 +585,7 @@ def chain_submit(
             verdict.score,
             verdict.bucket,
             verdict.label,
-            verdict.word_count,
+            verdict.assessment_word_count,
             verdict.probs,
             note,
             # Default parent is the previous draft; branch_from forks elsewhere.
@@ -654,6 +635,8 @@ def chain_submit(
         "score": round(verdict.score, 4),
         "label": verdict.label,
         "words": verdict.word_count,
+        "model_word_count": verdict.model_word_count if verdict.model_word_count is not None else verdict.word_count,
+        "assessment_word_count": verdict.assessment_word_count,
         "target_score": target,
         "target_met": verdict.score <= target,
         "best_score": round(best_score, 4),
@@ -669,8 +652,8 @@ def chain_submit(
         "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
     }
     # The score itself carries a caveat when there is barely any text to score.
-    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
-    short_note = _short_text_note(verdict.word_count)
+    out["reliable"] = verdict.assessment_word_count >= RELIABLE_WORDS
+    short_note = _short_text_note(verdict.assessment_word_count)
     if short_note:
         out["reliability_note"] = short_note
 
@@ -701,152 +684,17 @@ def chain_submit(
         out["span_min_words_used"] = span_meta["min_words_used"]
         out["source_fingerprint"] = text_fingerprint(text)
 
-    # A draft that lost ground against the best one is the case where "keep
-    # revising" is the wrong instruction: the caller already holds a better
-    # draft and every further edit compounds off the worse one. Recovering means
-    # chain_get_text + branch_from, and neither appears anywhere in a response
-    # unless it is said here -- observed for real, where a step went 0.035 ->
-    # 0.999 and next_action still just said "rewrite the worst spans".
-    regressed = (
-        prev_best is not None
-        and not is_new_best
-        and (
-            verdict.score - prev_best["score"] > REGRESSION_DELTA
-            or (prev_best["score"] <= target < verdict.score)
-        )
-    )
-
-    if verdict.score <= target:
-        if short_note:
-            # A short draft passes on the same noise that fails one: known-human
-            # passages under 25 words scored 0.02..0.69 on nothing but length.
-            # The old branch said a bare "Stop" here, declaring a chain finished
-            # on a score the SAME response flagged unreliable. False completion
-            # is the worse direction of that error.
-            out["next_action"] = (
-                f"Target met, BUT {short_note} Do not treat this as a pass on its "
-                f"own -- score it inside the full document (chain_assemble, or "
-                f"detect on the whole piece) before stopping."
-            )
-        else:
-            out["next_action"] = (
-                "Target met. Stop, or call chain_assemble if other segments remain."
-            )
-    elif regressed:
-        # segment= is interpolated into BOTH calls. Without it they fall back
-        # to segment='main', and step numbers are per-segment: in a
-        # multi-segment chain, following the bare instruction verbatim silently
-        # returned another segment's draft and filed the rewrite under it, all
-        # with ok=True.
-        out["next_action"] = (
-            f"Worse than step {best_step} ({round(prev_best['score'], 4)} vs "
-            f"{round(verdict.score, 4)}). Do not keep editing this draft. Call "
-            f"chain_get_text(segment='{segment}', step={best_step}) to recover the better "
-            f"one, then submit your next attempt with segment='{segment}', "
-            f"branch_from={best_step}. Nothing is lost -- this draft stays in the "
-            f"history as step {step_no}."
-        )
-    elif span_status == "ok" and out["spans_above_target"] == 0:
-        # Every span is already at or below target and the document is not. More
-        # span-hunting cannot help; the caller has to act on the whole passage.
-        # Left as "rewrite the worst spans", this is an infinite loop that asks a
-        # model to rewrite sentences the same response calls Human-written.
-        out["next_action"] = (
-            f"No span scores above the target -- span-level rewriting has bottomed out, so "
-            f"do not rewrite the spans below. {SCALE_NOTE} Whatever is left is document-level: "
-            f"try reordering, cutting the opening or closing sentence, varying sentence "
-            f"length, or rewriting the passage from scratch. Then call chain_submit again."
-        )
-    elif span_status == "ok" and out["spans_above_target_total"] == out["span_unit_count"]:
-        # Tested BEFORE the truncated branch, and on the whole-draft totals
-        # rather than the returned slice: when every unit is failing, whether
-        # the caller was told "patch these 5" or "rewrite the whole thing" used
-        # to depend only on span_top -- two mutually exclusive strategies
-        # selected by a display parameter.
-        out["next_action"] = (
-            f"Every one of the {out['span_unit_count']} units in this draft is above target, "
-            f"so there is nothing here to preserve on score grounds -- rewrite the whole "
-            f"passage in your own voice rather than patching spans, then call chain_submit "
-            f"again. The spans below are ranked worst-first if you want somewhere to start."
-        )
-    elif span_status == "ok" and out["spans_truncated"]:
-        # "Leave the rest alone -- they are already at or below target" was a
-        # flat falsehood here. On a 1548-word draft every one of 36 units scored
-        # above target and the response named 5, so that sentence described 31
-        # failing units as acceptable. A caller acting on it under-fixes the
-        # document on every round and is told it has finished the job each time.
-        hidden = out["spans_above_target_total"] - out["spans_above_target"]
-        out["next_action"] = (
-            f"Rewrite the {out['spans_above_target']} span(s) below marked above_target=true "
-            f"in your own voice, then call chain_submit again. These are the worst of "
-            f"{out['spans_above_target_total']} units above target out of "
-            f"{out['span_unit_count']} in this draft -- the other {hidden} are NOT shown and "
-            f"are NOT fine. Raise span_top to see more of them per round, or lower "
-            f"span_min_words for smaller spans, so each rewrite replaces less text."
-        )
-    elif span_status == "ok":
-        keep = out["span_unit_count"] - out["spans_above_target_total"]
-        out["next_action"] = (
-            f"Rewrite the {out['spans_above_target']} span(s) below marked above_target=true "
-            f"in your own voice, then call chain_submit again. Leave the other {keep} "
-            f"unit(s) alone -- they are already at or below target."
-        )
-    elif span_status == "too_short":
-        # One unit has nothing to rank against -- but say WHY there is one
-        # unit. This branch used to claim "too short" unconditionally, and the
-        # split failing on formatting (a bullet list, a table, verse) is not
-        # shortness: a 950-word draft was told it was too short to analyse
-        # while three numeric fields said zero units were above target, which
-        # reads as "nothing to fix". With the line-boundary fallback in
-        # split_units this now fires mostly on genuinely short text, but the
-        # single-long-line case still exists.
-        if verdict.word_count >= RELIABLE_WORDS:
-            out["next_action"] = (
-                "Could not divide this draft into rankable spans (no sentence "
-                "boundaries or line breaks found -- the document score above is "
-                "still valid). Rewrite the whole passage in your own voice, or "
-                "add paragraph breaks and resubmit to get span-level feedback."
-            )
-        else:
-            out["next_action"] = (
-                "Too short to pinpoint spans. Rewrite the whole passage in your own voice, "
-                "then call chain_submit again."
-            )
-    elif span_status == "failed":
-        out["next_action"] = (
-            "Span analysis failed (see span_error); the score above is still valid. "
-            "Revise and call chain_submit again."
-        )
-    else:
-        out["next_action"] = (
-            "Revise and call chain_submit again. Pass span_feedback=true, or call "
-            "detect_spans, to see which passages score worst."
-        )
-    # In a multi-segment chain, every failing branch above says "revise and
-    # resubmit" -- and an agent following that literally grinds each section to
-    # target in isolation, dozens of rewrites, when the assembled document
-    # would already have passed: sections routinely score far above the
-    # document they compose. Only chain_assemble's docstring said so, and an
-    # agent revising in a submit loop never has a reason to read it. Skipped
-    # when the short-text CAUTION below fires, which gives the same advice.
-    if len(segs) > 1 and verdict.score > target and not regressed and not short_note:
-        out["next_action"] += (
-            f" This is one of {len(segs)} sections, and section scores run high in "
-            f"isolation. Once every section has a draft, call chain_assemble before "
-            f"grinding this one further -- the document score decides completion."
-        )
-    # Every branch above except "target met" tells the caller to rewrite something.
-    # On a draft this short that instruction is built on a number that moves by
-    # more than the target itself between human passages of the same length, so
-    # the caveat has to come FIRST -- a caller that reads only next_action would
-    # otherwise never see it. Observed: a genuinely human 26-word note scored
-    # 0.4579 and was told to rewrite the offending span.
-    if short_note and verdict.score > target:
-        out["next_action"] = (
-            f"CAUTION: {short_note} If this draft is a section of something longer, "
-            f"finish the other sections and judge it with chain_assemble instead of "
-            f"revising it against this score. Otherwise: {out['next_action']}"
-        )
+    regressed = prev_best is not None and verdict.score - prev_best["score"] > REGRESSION_DELTA
+    out["score_note"] = SCORE_NOTE
+    out["target_note"] = TARGET_NOTE
+    out["analysis_note"] = SPAN_NOTE
+    out["scoring_profile"] = _scoring_profile()
+    out.update(length_assessment(verdict.assessment_word_count))
+    out.update(submission_advice(
+        out, words=verdict.assessment_word_count, segments=segs,
+        history=store.history(chain_id, segment, limit=5), regressed=regressed,
+        duplicate=prev is not None and prev["text"] == text,
+    ))
     return out
 
 
@@ -890,50 +738,44 @@ def chain_status(
         "above_target": above,
         "segments_with_better_earlier_draft": stale,
     }
-    # Without this a caller reads `pending` and starts revising, when the thing
-    # to do first is usually to assemble: a whole document routinely scores far
-    # below its own sections, so sections listed here as failing can already be
-    # good enough and the revision is wasted.
+    out["score_note"] = SCORE_NOTE
+    out["target_note"] = TARGET_NOTE
+    out["scoring_profile"] = json.loads(chain["meta"] or "{}").get("scoring_profile")
+    out["stop_recommended"] = False
     if not stats:
         out["next_action"] = "This chain declares no segments."
     elif unstarted:
         out["next_action"] = (
             f"Draft the segment(s) with no steps yet: {unstarted}. Call chain_submit "
-            f"with segment='{unstarted[0]}'."
-        )
-    elif above and len(stats) == 1:
-        # One segment: the assembled document IS this segment's best draft, so
-        # the assemble-first advice below would send the caller on a
-        # guaranteed-useless round trip -- the score is arithmetically the
-        # best_score already shown here -- while promising a change that cannot
-        # happen.
-        out["next_action"] = (
-            f"One segment: its score IS the document score, so assembling adds "
-            f"nothing. Revise '{stats[0]['segment']}' with chain_submit."
-        )
-    elif above:
-        out["next_action"] = (
-            f"Call chain_assemble first: {SCALE_NOTE} The assembled document often "
-            f"scores below every section that failed on its own, and the document score "
-            f"is what decides completion. Only if the document is still above target, "
-            f"revise {above} with chain_submit."
+            f"with segment={unstarted[0]!r}."
         )
     elif len(stats) == 1:
-        out["next_action"] = (
-            "The segment meets target, and with one segment its score IS the "
-            "document score. Done -- no assemble needed."
-        )
+        latest = store.latest_step(chain_id, segs[0])
+        history = store.history(chain_id, segs[0], limit=5)
+        progress = revision_progress(history, latest["step_no"])
+        out["revision_progress"] = progress
+        if latest["words"] < RELIABLE_WORDS:
+            out["next_action"] = _short_text_note(latest["words"])
+            out["stop_recommended"] = True
+        elif progress["plateau"] or progress["revision_budget_reached"]:
+            out["next_action"] = "Stop score-driven revisions for review. Inspect saved drafts and choose by accuracy, meaning, and voice."
+            out["stop_recommended"] = True
+        elif above:
+            out["next_action"] = "One segment: review its saved text directly; assembling adds nothing to its content. Review the writing before choosing whether to use chain_submit."
+        else:
+            out["next_action"] = "The segment meets the workflow target. Stop score-driven edits and review facts, meaning, and voice before using it."
+            out["stop_recommended"] = True
     else:
         out["next_action"] = (
-            "Every segment meets target. Call chain_assemble to score the whole "
-            "document -- assembly is what decides completion, not these per-segment scores."
+            "Call chain_assemble first to assess the complete document. "
+            + SCALE_NOTE + " Review the writing before choosing whether to use chain_submit."
         )
     if stale:
         # One instruction PER segment, each naming its segment. A single
         # chain_get_text(step='best') covering a list of segments defaults to
         # segment='main' and reads the wrong one.
         recover = "; ".join(
-            f"chain_get_text(segment='{s}', step='best')" for s in stale
+            f"chain_get_text(segment={s!r}, step='best')" for s in stale
         )
         out["next_action"] += (
             f" Note: in {stale} your latest draft scores worse than an earlier one; "
@@ -993,8 +835,8 @@ def chain_history(
         out["note"] = (
             f"The best draft of this segment is step {stats['best_step']} "
             f"({stats['best_score']}), which is older than the {len(rows)} step(s) shown. "
-            f"Raise `limit` to see it, chain_get_text(segment='{segment}', step='best') "
-            f"to read it, or chain_submit(segment='{segment}', "
+            f"Raise `limit` to see it, chain_get_text(segment={segment!r}, step='best') "
+            f"to read it, or chain_submit(segment={segment!r}, "
             f"branch_from={stats['best_step']}) to continue from it."
         )
     return out
@@ -1045,9 +887,9 @@ def chain_get_text(
         # describe; without a next_action here the second step (branch_from)
         # lived only in prose the caller may never have seen.
         "next_action": (
-            f"Revise this text, then chain_submit(segment='{segment}', "
-            f"branch_from={row['step_no']}) so the lineage records what you "
-            f"built on."
+            f"Review this saved draft for accuracy, meaning, and voice. If you choose "
+            f"to improve it, use chain_submit(segment={segment!r}, "
+            f"branch_from={row['step_no']}) to record the parent draft."
         ),
     }
 
@@ -1059,18 +901,14 @@ def chain_assemble(
     separator: Annotated[str, Field(description="Joiner between segments.")] = "\n\n",
     include_text: Annotated[bool, Field(description="Return the assembled document.")] = True,
 ) -> dict:
-    """Join the best draft of every segment in order and score the whole document.
+    """Join the lowest-scoring saved draft of each segment and score the document.
 
-    Always assemble before calling a multi-segment chain finished: the document
-    score is the one that counts, and it is NOT bounded by the section scores in
-    either direction. A document can come out above every section it is made of,
-    and it can come out far below them -- sections scoring 0.73 and 0.51 have
-    assembled into a 0.11 document, because the model scores short text harder
-    than the same words inside a longer piece. So assemble before you decide a
-    section needs more work, not after.
+    Section scores do not bound or explain the assembled score. Inspect the
+    selected drafts for accuracy and meaning before using the assembled text.
     """
     try:
         chain = store.get(chain_id)
+        _check_chain_profile(chain)
     except KeyError as exc:
         return _fail(exc)
     segs = json.loads(chain["segments"])
@@ -1080,17 +918,8 @@ def chain_assemble(
         if row is None:
             missing.append(s)
             continue
-        # Strip each part's own edge whitespace: the separator decides what goes
-        # between sections, not whatever blank lines a draft happened to end on.
-        # This is also what keeps the document score stable now that drafts are
-        # stored verbatim. clean_text collapses an indent run to ONE space rather
-        # than dropping it, so a segment whose first line is indented -- a code
-        # block, a nested bullet -- used to reach the model dedented and now
-        # reaches it with a leading space. Measured on the real checkpoint, that
-        # one character moved a 314-word document from 0.4881 to 0.6356. Stripping
-        # here reproduces the pre-change model input exactly (delta +0.0000 across
-        # every fixture and separator tested). Fidelity is chain_get_text's job,
-        # and it still returns the draft byte for byte.
+        # Assembly owns the separator. chain_get_text preserves the saved draft
+        # exactly; assembly strips only each part's leading/trailing whitespace.
         parts.append(row["text"].strip())
         per_segment.append(
             {"segment": s, "step": row["step_no"], "score": round(row["score"], 4),
@@ -1116,6 +945,8 @@ def chain_assemble(
         "document_score": round(verdict.score, 4),
         "document_label": verdict.label,
         "words": verdict.word_count,
+        "model_word_count": verdict.model_word_count if verdict.model_word_count is not None else verdict.word_count,
+        "assessment_word_count": verdict.assessment_word_count,
         "target_score": target,
         "target_met": complete and verdict.score <= target,
         "score_met": verdict.score <= target,
@@ -1124,14 +955,8 @@ def chain_assemble(
         "missing_segments": missing,
         "windows": len(windows),
     }
-    # The single most consequential instruction in the server is this tool's
-    # "Done." -- so it carries the same short-text caveat detect and
-    # chain_submit already carry. A 40-word assembled blurb can pass (or fail)
-    # the target on nothing but length noise, and this response used to say
-    # "Done." with no hint of the +/-0.3 spread chain_submit would have
-    # attached to the very same words.
-    out["reliable"] = verdict.word_count >= RELIABLE_WORDS
-    short_note = _short_text_note(verdict.word_count)
+    out["reliable"] = verdict.assessment_word_count >= RELIABLE_WORDS
+    short_note = _short_text_note(verdict.assessment_word_count)
     if short_note:
         out["reliability_note"] = short_note
     # chain_status calls these segments pending; this tool may simultaneously
@@ -1156,15 +981,14 @@ def chain_assemble(
                 f"{short_note} Treat this pass as provisional."
             )
         else:
-            out["next_action"] = "Document meets target and every segment has a draft. Done."
+            out["next_action"] = "Document meets target and every segment has a draft. Stop score-driven edits and review facts, meaning, and voice."
         if above:
             out["next_action"] += (
                 f" Segments {above} score above target ON THEIR OWN, and chain_status will "
                 f"list them as pending -- ignore that. {SCALE_NOTE} The document score is "
-                f"what decides completion, and it passed."
+                f"what the workflow threshold compares, and it is below that threshold."
             )
     else:
-        worst = max(per_segment, key=lambda p: p["score"])["segment"]
         # "the assembled text above" only exists when include_text is true;
         # with it false the instruction pointed at a field not in the response,
         # and no other tool returns the assembled document.
@@ -1174,18 +998,20 @@ def chain_assemble(
             else "the assembled text (re-call chain_assemble with include_text=true to get it)"
         )
         out["next_action"] = (
-            f"Document scores {round(verdict.score, 4)}, above the target {target}. Call "
-            f"detect_spans on {where} to find which passages drive it -- "
-            f"section scores are a poor guide here. Otherwise revise segment "
-            f"'{worst}' with chain_submit(segment='{worst}') and assemble again."
+            f"Document scores {round(verdict.score, 4)}, above target {target}. Review "
+            f"{where} for a concrete writing problem. detect_spans can show independent "
+            f"fragment estimates; it cannot identify the cause. Preserve sound content "
+            f"and stop if further edits would only chase the number."
         )
+    out["score_note"] = SCORE_NOTE
+    out["target_note"] = TARGET_NOTE
+    out["scoring_profile"] = _scoring_profile()
+    out.update(length_assessment(verdict.assessment_word_count))
+    out["stop_recommended"] = complete
     if len(segs) == 1:
-        # For a single-segment chain this whole call is a round trip to the
-        # segment's own best score; say so, so a driving agent stops scheduling
-        # assemble passes that cannot tell it anything new.
         out["note"] = (
-            "Single-segment chain: the assembled score is the segment's best "
-            "score by construction. chain_submit's feedback is all there is."
+            "Single-segment assembly uses the lowest-scoring saved draft, with edge "
+            "whitespace stripped. Review that draft directly with chain_get_text."
         )
     if include_text:
         out["text"] = document
@@ -1232,10 +1058,17 @@ def chain_delete(
 
 
 def main() -> None:
-    # Must happen on the main thread before any tool call -- see warmup_imports().
-    err = warmup_imports()
-    if err:
-        print(f"[editlens] warning: torch/transformers import failed: {err}", file=sys.stderr)
+    global detector
+    backend = (os.environ.get("EDITLENS_BACKEND") or "shared").strip().lower()
+    if backend == "shared":
+        from .shared import SharedDetector
+        detector = SharedDetector(**DETECTOR_CONFIG)
+    elif backend == "local":
+        err = warmup_imports()
+        if err:
+            print(f"[editlens] warning: torch/transformers import failed: {err}", file=sys.stderr)
+    else:
+        raise ValueError(f"Unknown EDITLENS_BACKEND={backend!r}; use shared or local")
     # `or "stdio"`, not a plain default: an EMPTY value reached fastmcp and died
     # with `ValueError: Unknown transport: ` -- which names nothing -- and empty
     # is what a client config emits for a field the user left blank. Same reason

@@ -3,3 +3,5 @@
 *.db
 *.db-wal
 *.db-shm
+.venv/
+.pytest_cache/

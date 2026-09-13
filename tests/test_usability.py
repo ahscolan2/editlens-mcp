@@ -35,7 +35,7 @@ TEXT = ("I burnt the rice again. Third time this month. My flatmate calls it a "
 BUCKETS = ["Human-written", "Lightly AI-edited", "Heavily AI-edited", "Fully AI-generated"]
 
 
-def _verdict(score: float, words: int = 30) -> Verdict:
+def _verdict(score: float, words: int = 100) -> Verdict:
     nb = len(BUCKETS)
     idx = int(round(score * (nb - 1)))
     return Verdict(score=score, bucket=idx, label=BUCKETS[idx],
@@ -50,7 +50,7 @@ class _Stub:
     guidance has to be able to set it without also changing every span.
     """
 
-    def __init__(self, doc: float, spans: list[float] | None = None, words: int = 30):
+    def __init__(self, doc: float, spans: list[float] | None = None, words: int = 100):
         self.doc, self.spans, self.words = doc, spans, words
 
     def __enter__(self):
@@ -82,15 +82,18 @@ TWELVE_UNITS = " ".join(
 async def main() -> None:
     async with Client(server.mcp) as c:
 
-        async def call(name, args=None):
-            return (await c.call_tool(name, args or {})).data
+        revision = 0
 
-        # ------------------------------------------------------------------
-        # 1. Spans that are already at or below target must not be handed back
-        #    as work. Observed live: three spans came back at 0.20 / 0.08 /
-        #    0.06 against a target of 0.25, under "Rewrite the worst spans".
-        #    Two of them were labelled Human-written.
-        # ------------------------------------------------------------------
+        async def call(name, args=None):
+            nonlocal revision
+            # Forced different scores represent different drafts. Keep them
+            # distinct so unchanged-draft stopping is tested separately below.
+            args = dict(args or {})
+            if name == "chain_submit":
+                revision += 1
+                args["text"] = f"v{revision:04d} " + args["text"]
+            return (await c.call_tool(name, args)).data
+
         cid = (await call("chain_create", {"name": "spans", "target_score": 0.25}))["chain_id"]
         with _Stub(0.9, spans=[0.9, 0.1]):
             r = await call("chain_submit", {"chain_id": cid, "text": TEXT})
@@ -103,15 +106,8 @@ async def main() -> None:
             "this fixture must produce a mix, or it proves nothing", r["worst_spans"])
         assert "above_target" in r["next_action"], r["next_action"]
         print(f"  spans carry above_target; {r['spans_above_target']} of "
-              f"{len(r['worst_spans'])} flagged for rewrite")
+              f"{len(r['worst_spans'])} above the numerical target")
 
-        # ------------------------------------------------------------------
-        # 2. The dead end: document above target, but NO span above it. Telling
-        #    the caller to rewrite the worst spans here is an instruction to
-        #    rewrite text this same response calls acceptable, and it never
-        #    terminates. Observed live at document 0.2992 with spans 0.2011 /
-        #    0.0769 / 0.0646 against target 0.25.
-        # ------------------------------------------------------------------
         with _Stub(0.2992, spans=[0.2011, 0.0646]):
             dead = await call("chain_submit", {"chain_id": cid, "text": TEXT})
         assert dead["target_met"] is False and dead["spans_above_target"] == 0, dead
@@ -119,15 +115,9 @@ async def main() -> None:
         assert "bottomed out" in na, dead["next_action"]
         assert "do not rewrite the spans" in na, dead["next_action"]
         # It must also explain WHY the parts look fine while the whole does not.
-        assert "not comparable across lengths" in na, dead["next_action"]
+        assert "not comparable across lengths" in dead["analysis_note"], dead
         print("  all-spans-under-target: told to stop span-hunting, not to loop")
 
-        # ------------------------------------------------------------------
-        # 3. A regression must point at the recovery route. History is
-        #    append-only and branch_from exists, but neither it nor
-        #    chain_get_text appeared anywhere in the response, so the only
-        #    advice after a 0.035 -> 0.999 step was "keep editing this draft".
-        # ------------------------------------------------------------------
         rid = (await call("chain_create", {"name": "regress", "target_score": 0.25}))["chain_id"]
         with _Stub(0.04, spans=[0.04, 0.04]):
             good = await call("chain_submit", {"chain_id": rid, "text": TEXT})
@@ -166,11 +156,6 @@ async def main() -> None:
         assert "target met" in noise["next_action"].lower(), noise["next_action"]
         print("  a 0.02 wobble under target does not trigger recovery advice")
 
-        # ------------------------------------------------------------------
-        # 4. chain_status told nobody what to do. `pending` also conflated a
-        #    segment with no drafts at all with one that has drafts scoring too
-        #    high -- opposite situations under one name.
-        # ------------------------------------------------------------------
         mid = (await call("chain_create", {
             "name": "multi", "target_score": 0.25,
             "segments": ["intro", "body", "end"]}))["chain_id"]
@@ -207,12 +192,6 @@ async def main() -> None:
             "assembling must be offered before revising", drafted["next_action"])
         print("  chain_status with a failing section: assemble first, then revise")
 
-        # ------------------------------------------------------------------
-        # 5. chain_assemble and chain_status can disagree, and both are right.
-        #    Observed live: sections at 0.733 and 0.5054 assembled into a 0.1077
-        #    document. chain_status said pending; assemble said target_met. A
-        #    caller given both with no reconciliation revises finished work.
-        # ------------------------------------------------------------------
         with _Stub(0.1077):
             asm = await call("chain_assemble", {"chain_id": mid, "include_text": False})
         assert asm["target_met"] is True and asm["complete"] is True, asm
@@ -244,11 +223,6 @@ async def main() -> None:
         assert "incomplete" in gap["next_action"].lower(), gap["next_action"]
         print("  chain_assemble(incomplete): asks for the missing section, not for a rewrite")
 
-        # ------------------------------------------------------------------
-        # 6. A segment whose latest draft is worse than an earlier one still
-        #    counts as target_met and still assembles from the earlier draft.
-        #    That is correct and completely invisible.
-        # ------------------------------------------------------------------
         sid = (await call("chain_create", {"name": "stale", "target_score": 0.25}))["chain_id"]
         with _Stub(0.05, spans=[0.05, 0.05]):
             await call("chain_submit", {"chain_id": sid, "text": TEXT})
@@ -262,11 +236,6 @@ async def main() -> None:
         print("  chain_status flags a segment whose latest draft is not the one "
               "assembly will use")
 
-        # ------------------------------------------------------------------
-        # 7. detect_batch ranks; it does not judge. Observed live: candidates at
-        #    0.50 / 0.99 / 0.66, and the winner spliced in took its document to
-        #    0.06. best_score compared against a target rejects all three.
-        # ------------------------------------------------------------------
         with _Stub(0.5, spans=[0.5, 0.99, 0.66]):
             b = await call("detect_batch", {"texts": ["one", "two", "three"]})
         assert b["ok"] and "comparison_note" in b, b
@@ -274,24 +243,12 @@ async def main() -> None:
         assert "detect" in b["comparison_note"], b["comparison_note"]
         print("  detect_batch carries comparison_note: rank, then re-score after splicing")
 
-        # ------------------------------------------------------------------
-        # 8. The server instructions are the only guidance a model gets before
-        #    it reads any tool. Both counter-intuitive facts have to be there.
-        # ------------------------------------------------------------------
         instr = server.mcp.instructions
         assert "next_action" in instr, instr
         assert "branch_from" in instr and "chain_get_text" in instr, instr
         assert "not comparable across lengths" in instr, instr
         print("  server instructions name next_action, the scale caveat, and recovery")
 
-        # ------------------------------------------------------------------
-        # 9. `worst_spans` holds at most `span_top` entries, but next_action
-        #    described everything NOT in it as "already at or below target".
-        #    Measured live on a 1548-word document: 36 units, all 36 above a
-        #    0.25 target, 5 reported -- so 31 failing units were called
-        #    acceptable, every round, while the caller believed it had done the
-        #    work the tool asked for.
-        # ------------------------------------------------------------------
         tid = (await call("chain_create", {"name": "trunc", "target_score": 0.25}))["chain_id"]
         with _Stub(0.9, spans=[0.9]):
             t = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS})
@@ -302,15 +259,11 @@ async def main() -> None:
         na = t["next_action"]
         # The exact false claim. It must not survive anywhere in the response.
         assert "already at or below target" not in na, na
-        # ALL 12 units failing is the whole-rewrite case, and it must win even
-        # though the list is truncated: which strategy the caller was told --
-        # "patch these 5" vs "rewrite everything" -- used to depend only on
-        # whether span_top happened to be >= unit_count, a display parameter
-        # selecting between mutually exclusive plans.
-        assert "Every one of the 12 units" in na, na
-        assert "rewrite the whole passage" in na, na
-        print(f"  all-12-above with span_top=5: whole-rewrite advice wins over the "
-              f"truncated-window wording (strategy no longer depends on span_top)")
+        # Showing more fragments must never turn a score into a mandate to
+        # rewrite the whole document.
+        assert "Preserve sound content" in na, na
+        assert "rewrite the whole passage" not in na, na
+        print("  all spans high: preserve sound content; display limit never mandates a rewrite")
 
         # A window that happens to hide only SOME failing units is the same bug.
         with _Stub(0.9, spans=[0.9, 0.1]):
@@ -326,32 +279,19 @@ async def main() -> None:
                                                "span_top": 12})
         assert full["spans_truncated"] is False, full
         assert full["spans_above_target"] == full["spans_above_target_total"] == 6, full
-        assert "Leave the other 6 unit(s) alone" in full["next_action"], full["next_action"]
-        print("  untruncated: 'leave the other 6 alone' counts all 12 units, not the 5 shown")
+        assert full["revision_state"] == half["revision_state"] == "review_draft", full
+        print("  changing the display window preserves the same review advice")
 
-        # ------------------------------------------------------------------
-        # 10. When every unit is above target there is no "rest" to leave alone,
-        #     and saying so sends the caller hunting for a safe passage that
-        #     does not exist. Live: a 94-word paragraph, 3 units, all 3 above.
-        # ------------------------------------------------------------------
         with _Stub(0.9, spans=[0.9]):
             allbad = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS,
                                                  "span_top": 12})
         assert allbad["spans_above_target"] == allbad["span_unit_count"] == 12, allbad
         assert allbad["spans_truncated"] is False, allbad
         na = allbad["next_action"]
-        assert "nothing here to preserve" in na, na
+        assert "Preserve sound content" in na and "nothing here to preserve" not in na, na
         assert "already at or below target" not in na and "Leave the other" not in na, na
-        print("  all 12 units above target: told to rewrite the passage, not to keep part of it")
+        print("  all 12 units high: still told to preserve sound content")
 
-        # ------------------------------------------------------------------
-        # 11. span_top and span_min_words have to reach the splitter. Measured:
-        #     driving a 1548-word document to target rewrote 56% of it at the
-        #     default min_words=25 over 4 rounds, and 15% over 2 rounds at 15,
-        #     because a span is the quantum of rewriting -- so the knob that
-        #     sets span size is the one that decides how much of the author's
-        #     text a revision loop destroys. detect_spans had it; this did not.
-        # ------------------------------------------------------------------
         with _Stub(0.9, spans=[0.9]):
             coarse = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS})
             fine = await call("chain_submit", {"chain_id": tid, "text": TWELVE_UNITS,
@@ -371,25 +311,16 @@ async def main() -> None:
               f"1 -> {fine['span_unit_count']} units; span_top widened "
               f"{len(coarse['worst_spans'])} -> {len(fine['worst_spans'])}")
 
-        # ------------------------------------------------------------------
-        # 12. EditLens false-positives on short informal human writing -- that
-        #     is the model. What the server did with it was the defect: a
-        #     genuinely human 26-word note scored 0.4579 and the only advice
-        #     was "rewrite the span above target", with nothing anywhere saying
-        #     the number was noise. Measured on five known-human passages cut
-        #     to length, the score spread across them was 0.63 at 15 words and
-        #     0.06 by 60, and one crossed a 0.25 target on length alone.
-        # ------------------------------------------------------------------
         wid = (await call("chain_create", {"name": "wee", "target_score": 0.25}))["chain_id"]
         with _Stub(0.46, spans=[0.9, 0.1], words=26):
             tiny = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
-        assert tiny["reliable"] is True, "26 words clears the per-unit floor of 25"
+        assert tiny["reliable"] is False and not tiny["length_sufficient"], tiny
         assert "reliability_note" in tiny and "26 words" in tiny["reliability_note"], tiny
         na = tiny["next_action"]
         assert na.startswith("CAUTION:"), na
         assert "chain_assemble" in na, na
         # The caution leads; the ordinary advice still follows it.
-        assert "above_target=true" in na, na
+        assert "Do not revise to chase this score" in na, na
         print(f"  26-word draft over target: next_action leads with the caution, "
               f"not with 'rewrite it'")
 
@@ -405,30 +336,21 @@ async def main() -> None:
         assert big["reliable"] is True and "reliability_note" not in big, big
         assert not big["next_action"].startswith("CAUTION:"), big["next_action"]
 
-        # Nor a short draft that already MET target -- there is nothing to warn
-        # off doing, and "stop" is not advice that needs a caveat.
+        # A low score on short text also needs the length caveat.
         with _Stub(0.05, spans=[0.05], words=26):
             ok_small = await call("chain_submit", {"chain_id": wid, "text": TWELVE_UNITS})
-        assert not ok_small["next_action"].startswith("CAUTION:"), ok_small["next_action"]
-        print("  the caution fires only on short drafts that are still above target")
+        assert ok_small["next_action"].startswith("CAUTION:"), ok_small["next_action"]
+        print("  short drafts receive the length caveat on either side of target")
 
         # `detect` reported a bare 4-decimal score for any length at all.
         with _Stub(0.46, words=26):
             d = await call("detect", {"text": TWELVE_UNITS})
-        assert d["reliable"] is True and "26 words" in d["reliability_note"], d
+        assert d["reliable"] is False and "26 words" in d["reliability_note"], d
         with _Stub(0.46, words=600):
             d2 = await call("detect", {"text": TWELVE_UNITS})
         assert d2["reliable"] is True and "reliability_note" not in d2, d2
         print("  detect carries the same length caveat detect_spans always had")
 
-        # ------------------------------------------------------------------
-        # 13. The README sells chains that run for hundreds of steps. At 65
-        #     steps chain_history(limit=30) returned steps 36..65 and called it
-        #     the trajectory; the best draft was step 4 and nothing said so.
-        #     Scanning the returned trajectory for its lowest score -- the
-        #     obvious move, and the one branch_from needs an answer for --
-        #     silently picks the best of the last thirty.
-        # ------------------------------------------------------------------
         lid = (await call("chain_create", {"name": "long", "target_score": 0.01}))["chain_id"]
         with _Stub(0.30, spans=[0.30]):
             await call("chain_submit", {"chain_id": lid, "text": TEXT, "note": "the good one"})
@@ -462,15 +384,6 @@ async def main() -> None:
         assert blank["best_step"] is None and "note" not in blank, blank
         print("  an empty segment reports total_steps=0 and no best step")
 
-        # ------------------------------------------------------------------
-        # 14. Guidance must know how many segments there are. A single-segment
-        #     chain (the default) was told to assemble first, where the
-        #     assembled score is arithmetically the segment's best score --
-        #     dozens of wasted forward passes over a long chain, each promising
-        #     a change that cannot happen. And a multi-segment chain was NEVER
-        #     told about chain_assemble in the submit loop, so an agent ground
-        #     every section to target in isolation.
-        # ------------------------------------------------------------------
         solo = (await call("chain_create", {"name": "solo", "target_score": 0.25}))["chain_id"]
         with _Stub(0.9, spans=[0.9, 0.9], words=80):
             await call("chain_submit", {"chain_id": solo, "text": TEXT})
@@ -489,18 +402,13 @@ async def main() -> None:
         print("  single-segment status skips the useless assemble; multi-segment "
               "submit names chain_assemble")
 
-        # ------------------------------------------------------------------
-        # 15. "Target met. Stop." on a 12-word draft declares a chain finished
-        #     on a score the SAME response flags unreliable -- the noise is
-        #     two-sided, and false completion is its worse direction.
-        # ------------------------------------------------------------------
         shorty = (await call("chain_create", {"name": "short", "target_score": 0.25}))["chain_id"]
         with _Stub(0.11, spans=[0.11], words=12):
             sh = await call("chain_submit", {"chain_id": shorty, "text": "tiny draft"})
         assert sh["target_met"] is True and sh["reliable"] is False
         na = sh["next_action"]
-        assert na.startswith("Target met, BUT"), na
-        assert "Do not treat this as a pass on its own" in na, na
+        assert na.startswith("CAUTION:"), na
+        assert sh["stop_recommended"] and sh["revision_state"] == "insufficient_length", sh
         print("  target met on 12 words: next_action withholds the bare 'Stop'")
 
         # chain_assemble carries the same short-text caveat on its "Done."
