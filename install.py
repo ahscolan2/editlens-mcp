@@ -10,9 +10,11 @@ MCP client config for this install. Safe to re-run.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -47,11 +49,13 @@ def check_torch() -> str | None:
 
 def check_hf() -> str | None:
     try:
-        from huggingface_hub import HfApi
+        from huggingface_hub import get_hf_file_metadata, hf_hub_url
     except Exception as exc:  # noqa: BLE001
         return f"huggingface_hub not importable: {exc}"
     try:
-        HfApi().model_info(CHECKPOINT)
+        # Public model metadata is visible even without gated-file access.
+        # A HEAD request to an actual file checks the download permission.
+        get_hf_file_metadata(hf_hub_url(CHECKPOINT, "config.json"))
     except Exception as exc:  # noqa: BLE001
         return (
             f"cannot reach {CHECKPOINT}: {type(exc).__name__}: {exc}\n"
@@ -92,6 +96,14 @@ def main() -> int:
             f"python`) and re-run this script with it."
         )
         return 1
+    project_python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if (os.environ.get("EDITLENS_USE_CURRENT_PYTHON") != "1"
+            and os.path.normcase(str(Path(sys.executable).absolute()))
+            != os.path.normcase(str(project_python.absolute()))):
+        if not project_python.exists():
+            print(f"Creating isolated environment: {ROOT / '.venv'}", flush=True)
+            venv.create(ROOT / ".venv", with_pip=True)
+        return run([str(project_python), str(ROOT / "install.py")])
     print(f"EditLens MCP setup — {sys.platform}, Python {sys.version.split()[0]}")
     print(f"Project: {ROOT}")
 

@@ -1,16 +1,14 @@
-# Pinned to the verified stack (Windows, Python 3.13.14, 2026-08-12):
-#   fastmcp 3.4.6 / transformers 5.15.0 / safetensors 0.8.0 / huggingface_hub 1.27.0
-#   torch 2.13.0+cu126 / tokenizers 0.22.2 / pydantic 2.13.4
-# Floors are the verified versions; ceilings stop a fresh install from silently
-# taking the next major release, which is how transformers drifted from the
-# original ">=4.44" floor to 5.x with nothing recording what actually worked.
+# Compatible version ranges, not an exact environment lock.
+# Verified environment and research sources are recorded in docs/RESEARCH.md.
+# Ceilings keep fresh installs within the tested major versions.
 # Requires Python >= 3.10 (install.py enforces this).
 fastmcp>=3.4,<4
 transformers>=5.15,<6
 safetensors>=0.8,<2
 huggingface_hub>=1.27,<2
+emoji>=2.10,<3
 # torch is installed separately so you get the right build for your hardware
-# (install.py picks the command; verified with torch 2.13):
+# (install.py picks the command; verified with torch 2.14):
 #   Windows/Linux+CUDA:  pip install torch --index-url https://download.pytorch.org/whl/cu126
 #   macOS (Metal included in the default wheel):  pip install torch
 # peft is only needed if the checkpoint ever ships as an adapter-only repo:

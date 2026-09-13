@@ -2,7 +2,7 @@
 and drive it. This is the path Antigravity uses.
 """
 
-import asyncio, json, os, sys, tempfile
+import asyncio, json, os, sys, tempfile, time
 from pathlib import Path
 
 PY = sys.executable
@@ -16,6 +16,10 @@ async def main():
     workdir = tempfile.mkdtemp()
     env = dict(os.environ)
     env["EDITLENS_DB"] = str(Path(workdir) / "sub.db")
+    runtime = Path(workdir) / "runtime"
+    env["EDITLENS_RUNTIME_DIR"] = str(runtime)
+    env["EDITLENS_WORKER_IDLE"] = "3"
+    env["EDITLENS_BACKEND"] = "shared"
     # Launch from an unrelated cwd: clients rarely set one. It must not be the repo
     # root, or the server would import editlens_mcp from cwd and hide a packaging bug.
     # A temp dir is unrelated on every platform; a hardcoded one is not.
@@ -27,6 +31,8 @@ async def main():
         print(f"connected. {len(tools)} tools: {', '.join(tools)}")
 
         info = (await c.call_tool("detector_info", {})).data
+        assert info["backend"] == "shared", info
+        worker_pid = info["worker_pid"]
         print(f"info -> device={info['device']} dtype={info['dtype']} "
               f"loaded={info['loaded']} idle_unload={info['idle_unload_seconds']}s")
 
@@ -81,6 +87,54 @@ async def main():
         oks = [x.data["ok"] for x in rs]
         print(f"10 concurrent detects -> all_ok={all(oks)}")
         assert all(oks), [x.data for x in rs if not x.data["ok"]]
+
+        # Independent stdio processes must use the same worker and database.
+        # An older client configuration may still name global Python. The
+        # launcher must select this checkout's .venv before importing FastMCP.
+        global_python = getattr(sys, "_base_executable", PY)
+        other_transport = StdioTransport(command=global_python, args=[SCRIPT], env=env, cwd=workdir)
+        async with Client(other_transport) as other:
+            other_info = (await other.call_tool("detector_info", {})).data
+            assert other_info["worker_pid"] == worker_pid, (info, other_info)
+            statuses = await asyncio.gather(
+                c.call_tool("detect", {"text": "The two clients share inference."}),
+                other.call_tool("detect", {"text": "The two clients share inference."}),
+            )
+            assert all(result.data["ok"] for result in statuses), statuses
+            assert statuses[0].data["score"] == statuses[1].data["score"], statuses
+            original = "  Saved from client two.\r\n\tExact whitespace stays.\n"
+            saved = (await other.call_tool("chain_submit", {
+                "chain_id": cid, "segment": "a", "text": original,
+                "span_feedback": False, "branch_from": 1,
+            })).data
+            recovered = (await c.call_tool("chain_get_text", {
+                "chain_id": cid, "segment": "a", "step": saved["step"],
+            })).data
+            assert saved["ok"] and saved["parent_step"] == 1, saved
+            assert recovered["text"] == original, recovered
+            print(f"2 independent MCP processes -> worker PID {worker_pid}; equal scores, shared draft and branch recovered exactly")
+
+    # The test worker must leave before the runner removes its private runtime.
+    deadline = time.monotonic() + 20
+    while any(runtime.glob("*.json")) and time.monotonic() < deadline:
+        registries = [p for p in runtime.glob("*.json") if not p.name.endswith(".config.json")]
+        if not registries:
+            break
+        await asyncio.sleep(0.1)
+    assert not [p for p in runtime.glob("*.json") if not p.name.endswith(".config.json")], "test worker did not exit when idle"
+    # Windows' Python venv launcher may hold the worker log briefly after the
+    # registry disappears. Only these test-owned logs are removed.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        for log in runtime.glob("*.log"):
+            try:
+                log.unlink()
+            except PermissionError:
+                pass
+        if not list(runtime.glob("*.log")):
+            break
+        await asyncio.sleep(0.1)
+    assert not list(runtime.glob("*.log")), "test worker retained log handles after exit"
 
     print("\nSUBPROCESS TEST PASSED")
 

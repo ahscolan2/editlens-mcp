@@ -15,11 +15,16 @@ import sys
 import threading
 import time
 import unicodedata
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from typing import Sequence
 
+from .preprocessing import LEGACY_VERSION, REFERENCE_VERSION, reference_text_with_map
+
 CHECKPOINT = os.environ.get("EDITLENS_CHECKPOINT", "pangram/editlens_roberta-large")
+DEFAULT_CHECKPOINT_REVISION = "f93e1ace74528cfb48f337ab2fe946fb71a728cb"
 BASE_MODEL = os.environ.get("EDITLENS_BASE_MODEL", "FacebookAI/roberta-large")
 MAX_LENGTH = 512
 # Room for <s> and </s>, plus slack. Windows are chosen on the full document's
@@ -107,6 +112,14 @@ class Verdict:
     word_count: int = 0
     char_count: int = 0
     truncated_windows: int = 1
+    model_word_count: int | None = None
+
+    @property
+    def assessment_word_count(self) -> int:
+        # A conservative server length check: the shorter of the original
+        # readable-word count and the remaining model-input count. This avoids
+        # both discarded headers and emoji/contraction expansion inflating it.
+        return self.word_count if self.model_word_count is None else min(self.word_count, self.model_word_count)
 
     def as_dict(self) -> dict:
         return {
@@ -117,6 +130,8 @@ class Verdict:
             "word_count": self.word_count,
             "char_count": self.char_count,
             "windows": self.truncated_windows,
+            "model_word_count": self.model_word_count if self.model_word_count is not None else self.word_count,
+            "assessment_word_count": self.assessment_word_count,
         }
 
 
@@ -126,8 +141,11 @@ _WORD = re.compile(r"\b[\w'’-]+\b", re.UNICODE)
 
 
 def clean_text(text: str) -> str:
-    """Conservative normalisation. Whitespace only -- never rewrites wording,
-    because that would change what the detector actually sees."""
+    """Whitespace-only display/segmentation normalization.
+
+    Reference model preprocessing is separate and also applies when a caller
+    passes an already display-normalized document with normalise=False.
+    """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _WS_RUN.sub(" ", text)
     text = "\n".join(line.rstrip() for line in text.split("\n"))
@@ -291,11 +309,19 @@ class EditLensDetector:
         batch_size: int = 8,
         dtype: str | None = None,
         idle_unload_seconds: float = 300.0,
+        preprocessing: str = "reference",
+        revision: str | None = None,
     ) -> None:
         self.checkpoint = checkpoint
+        self.revision = revision or os.environ.get("EDITLENS_REVISION") or (
+            DEFAULT_CHECKPOINT_REVISION if checkpoint == "pangram/editlens_roberta-large" else None
+        )
         self.base_model = base_model
         self._requested_device = device
         self._requested_dtype = dtype
+        if preprocessing not in {"reference", "legacy"}:
+            raise ValueError("preprocessing must be 'reference' or 'legacy'")
+        self.preprocessing = preprocessing
         # A batch size below 1 is not a slower configuration, it is a broken one:
         # _score_batch steps `range(0, n, batch_size)`, so 0 raises "range() arg 3
         # must not be zero" and a negative value scores nothing and then divides by
@@ -335,6 +361,29 @@ class EditLensDetector:
     @property
     def loaded(self) -> bool:
         return self._loaded
+
+    @property
+    def preprocessing_version(self) -> str:
+        return REFERENCE_VERSION if self.preprocessing == "reference" else LEGACY_VERSION
+
+    def scoring_identity(self) -> dict:
+        """Stable scoring provenance, available without loading the model."""
+        identity = {
+            "checkpoint": self.checkpoint,
+            "checkpoint_revision": self.revision,
+            "base_model": self.base_model,
+            "preprocessing": self.preprocessing,
+            "preprocessing_version": self.preprocessing_version,
+            "score_semantics": "expected_bucket_index",
+            "bucket_semantics": "argmax_probability",
+            "max_length": MAX_LENGTH,
+        }
+        if self.preprocessing == "reference":
+            try:
+                identity["emoji_version"] = version("emoji")
+            except PackageNotFoundError:
+                identity["emoji_version"] = "unavailable"
+        return identity
 
     def _planned_device(self) -> tuple[str, str]:
         """What device/dtype a load would pick right now. Reported before the
@@ -386,6 +435,7 @@ class EditLensDetector:
     def info(self) -> dict:
         device, dtype = self._planned_device()
         return {
+            **self.scoring_identity(),
             "checkpoint": self.checkpoint,
             "base_model": self.base_model,
             "loaded": self._loaded,
@@ -447,7 +497,7 @@ class EditLensDetector:
         accel = accelerator_of(self.device)
         try:
             if accel == "cuda":
-                return round(self.torch.cuda.memory_allocated() / 1024**2, 1)
+                return round(self.torch.cuda.memory_allocated(self.device) / 1024**2, 1)
             if accel == "mps":
                 return round(self.torch.mps.current_allocated_memory() / 1024**2, 1)
         except Exception:  # noqa: BLE001 - reporting must never break info()
@@ -648,9 +698,10 @@ class EditLensDetector:
         self.torch = torch
         token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         kwargs = {"token": token} if token else {}
+        checkpoint_kwargs = {**kwargs, **({"revision": self.revision} if self.revision else {})}
 
         try:
-            tokenizer = AutoTokenizer.from_pretrained(self.checkpoint, **kwargs)
+            tokenizer = AutoTokenizer.from_pretrained(self.checkpoint, **checkpoint_kwargs)
         except Exception as primary:  # tokenizer files may live only on the base repo
             try:
                 tokenizer = AutoTokenizer.from_pretrained(self.base_model, **kwargs)
@@ -658,7 +709,7 @@ class EditLensDetector:
                 raise primary from None
 
         try:
-            model = AutoModelForSequenceClassification.from_pretrained(self.checkpoint, **kwargs)
+            model = AutoModelForSequenceClassification.from_pretrained(self.checkpoint, **checkpoint_kwargs)
         except Exception as primary:
             # Fall back to the PEFT-adapter layout if the repo ships an adapter
             # only. If that fallback cannot even start, re-raise the ORIGINAL
@@ -669,7 +720,7 @@ class EditLensDetector:
             try:
                 from peft import PeftConfig, PeftModel  # noqa: PLC0415
 
-                cfg = PeftConfig.from_pretrained(self.checkpoint, **kwargs)
+                cfg = PeftConfig.from_pretrained(self.checkpoint, **checkpoint_kwargs)
                 n_labels = getattr(cfg, "num_labels", None) or 4
                 base = AutoModelForSequenceClassification.from_pretrained(
                     cfg.base_model_name_or_path or self.base_model,
@@ -677,7 +728,7 @@ class EditLensDetector:
                     **kwargs,
                 )
                 model = PeftModel.from_pretrained(
-                    base, self.checkpoint, **kwargs
+                    base, self.checkpoint, **checkpoint_kwargs
                 ).merge_and_unload()
             except Exception:
                 raise primary from None
@@ -703,6 +754,8 @@ class EditLensDetector:
         self.dtype = dtype_name
         self._last_device, self._last_dtype = device, dtype_name
         self.n_buckets = int(model.config.num_labels)
+        if self.n_buckets < 2:
+            raise ValueError("EditLens requires a classifier with at least two buckets")
         self.bucket_names = BUCKET_NAMES.get(
             self.n_buckets, [f"bucket_{i}" for i in range(self.n_buckets)]
         )
@@ -722,13 +775,19 @@ class EditLensDetector:
             chunk = list(texts[start : start + self.batch_size])
             inputs = tokenizer(
                 chunk,
-                truncation=True,
-                max_length=MAX_LENGTH,
+                truncation=False,
                 padding=True,
                 return_tensors="pt",
             ).to(self.device)
+            if inputs["input_ids"].shape[-1] > MAX_LENGTH:
+                raise ValueError("model window exceeds max_length; refusing to truncate text")
             with torch.no_grad():
                 logits = model(**inputs).logits
+            if not bool(torch.isfinite(logits).all().item()):
+                raise DetectorUnavailable(
+                    "The model returned non-finite logits (NaN or infinity). "
+                    "No score was produced; try float32 precision or the CPU device."
+                )
             probs = torch.softmax(logits.float(), dim=-1).cpu()
             for row in probs:
                 score = float((row @ labels).item() / (self.n_buckets - 1))
@@ -736,7 +795,7 @@ class EditLensDetector:
         return out
 
     def windows(self, text: str, overlap_tokens: int = 64) -> list[tuple[int, int, str]]:
-        """Split text into (start_char, end_char, chunk) windows that fit the model."""
+        """Split already-preprocessed model text into windows without truncation."""
         self.ensure_loaded()
         # verbose=False: we tokenise the whole document on purpose to find split
         # points, so the "longer than max sequence length" warning is expected noise.
@@ -745,21 +804,63 @@ class EditLensDetector:
         )
         ids = enc["input_ids"]
         offsets = enc["offset_mapping"]
-        if len(ids) <= MAX_CONTENT_TOKENS:
+        content_limit = (
+            MAX_CONTENT_TOKENS if self.preprocessing == "legacy"
+            else MAX_LENGTH - self.tokenizer.num_special_tokens_to_add(pair=False)
+        )
+        if len(ids) <= content_limit:
             return [(0, len(text), text)]
 
-        step = max(1, MAX_CONTENT_TOKENS - overlap_tokens)
         spans: list[tuple[int, int, str]] = []
         pos = 0
         while pos < len(ids):
-            end_tok = min(pos + MAX_CONTENT_TOKENS, len(ids))
-            c0 = offsets[pos][0]
-            c1 = offsets[end_tok - 1][1]
+            end_tok = min(pos + content_limit, len(ids))
+            c0 = 0 if pos == 0 else offsets[pos][0]
+            # Slicing changes RoBERTa's leading-space context; repeated offsets
+            # for UTF-8 token pieces can also expand on re-tokenization. Prove
+            # each actual slice fits instead of relying on a fixed safety margin.
+            while end_tok > pos:
+                c1 = len(text) if end_tok == len(ids) else offsets[end_tok - 1][1]
+                n_tokens = len(self.tokenizer(
+                    text[c0:c1], add_special_tokens=True, verbose=False
+                )["input_ids"])
+                if n_tokens <= MAX_LENGTH and c1 > c0:
+                    break
+                end_tok -= 1
+            if end_tok <= pos:
+                raise ValueError("cannot fit a text character into the model token limit")
             spans.append((c0, c1, text[c0:c1]))
             if end_tok >= len(ids):
                 break
-            pos += step
+            pos = max(pos + 1, end_tok - max(0, overlap_tokens))
         return spans
+
+    def _prepare(
+        self, text: str, normalise: bool
+    ) -> tuple[str, str, list[tuple[int, int]]]:
+        """Return display text, model text, and model-to-display ranges.
+
+        Reference preprocessing always starts from the supplied text. Applying
+        display cleanup first would change the reference's header decisions for
+        CR-only documents. The inverse display map retains the established
+        detect() offset contract without changing what reaches the model.
+        """
+        if normalise:
+            source, display_ranges = clean_text_with_map(text)
+        else:
+            source, display_ranges = text, []
+        if not source.strip():
+            raise ValueError("empty text")
+        if self.preprocessing == "legacy":
+            return source, source, [(i, i + 1) for i in range(len(source))]
+        model_text, ranges = reference_text_with_map(text)
+        if not model_text:
+            raise ValueError("text is empty after reference preprocessing")
+        if normalise:
+            starts = [a for a, _ in display_ranges]
+            ends = [b for _, b in display_ranges]
+            ranges = [(bisect_right(ends, a), bisect_left(starts, b)) for a, b in ranges]
+        return source, model_text, ranges
 
     @staticmethod
     def _owned_ranges(
@@ -786,13 +887,15 @@ class EditLensDetector:
 
     def detect(self, text: str, normalise: bool = True) -> tuple[Verdict, list[dict]]:
         """Score a document. Long inputs are windowed and length-weighted."""
-        source = clean_text(text) if normalise else text
-        if not source.strip():
-            raise ValueError("empty text")
+        source, model_text, ranges = self._prepare(text, normalise)
 
         with self._active():
-            spans = self.windows(source)
-            scored = self._score_batch([s[2] for s in spans])
+            model_spans = self.windows(model_text)
+            scored = self._score_batch([s[2] for s in model_spans])
+        spans = []
+        for start, end, _ in model_spans:
+            c0, c1 = map_span(ranges, start, end, len(source))
+            spans.append((c0, c1, source[c0:c1]))
 
         # Weight each window by the text it exclusively OWNS, not by its full
         # length. Windows overlap by design (the model needs context either side
@@ -800,7 +903,7 @@ class EditLensDetector:
         # measured up to +0.03 score inflation on documents just over one window,
         # i.e. ordinary essay length. Overlaps are split at their midpoint so
         # every character is counted exactly once.
-        owned = self._owned_ranges(spans, len(source))
+        owned = self._owned_ranges(spans, spans[-1][1])
 
         details: list[dict] = []
         total_w = 0.0
@@ -819,14 +922,15 @@ class EditLensDetector:
                     "owned_end": o1,
                     "words": int(w),
                     "score": round(score, 4),
-                    "label": self.bucket_names[int(round(score * (self.n_buckets - 1)))],
+                    "bucket": max(range(len(probs)), key=probs.__getitem__),
+                    "label": self.bucket_names[max(range(len(probs)), key=probs.__getitem__)],
                     "preview": chunk[:120].replace("\n", " "),
                 }
             )
 
         score = acc_score / total_w
         probs = [p / total_w for p in acc_probs]
-        bucket = int(round(score * (self.n_buckets - 1)))
+        bucket = max(range(len(probs)), key=probs.__getitem__)
         verdict = Verdict(
             score=score,
             bucket=bucket,
@@ -835,6 +939,7 @@ class EditLensDetector:
             word_count=count_words(source),
             char_count=len(source),
             truncated_windows=len(spans),
+            model_word_count=len(re.findall(r"\b\w+\b", model_text)),
         )
         return verdict, details
 
@@ -843,7 +948,12 @@ class EditLensDetector:
 
         Any item too long for a single window falls back to windowed scoring.
         """
-        prepared = [clean_text(t) if normalise else t for t in texts]
+        prepared = []
+        for i, text in enumerate(texts):
+            try:
+                prepared.append(self._prepare(text, normalise))
+            except ValueError as exc:
+                raise ValueError(f"item {i}: {exc}") from exc
         simple_idx: list[int] = []
         simple_txt: list[str] = []
         results: list[Verdict | None] = [None] * len(prepared)
@@ -852,29 +962,25 @@ class EditLensDetector:
             # Inside _active(), not before it: between an outer ensure_loaded()
             # and acquiring the lock, an unload could null the tokenizer.
             self.ensure_loaded()
-            for i, t in enumerate(prepared):
-                if not t.strip():
-                    raise ValueError(f"item {i} is empty")
-                n_tok = len(
-                    self.tokenizer(t, add_special_tokens=False, verbose=False)["input_ids"]
-                )
-                if n_tok <= MAX_CONTENT_TOKENS:
+            for i, (_, model_text, _) in enumerate(prepared):
+                if len(self.windows(model_text)) == 1:
                     simple_idx.append(i)
-                    simple_txt.append(t)
+                    simple_txt.append(model_text)
                 else:
-                    results[i], _ = self.detect(t, normalise=False)
+                    results[i], _ = self.detect(texts[i], normalise=normalise)
             scored_simple = self._score_batch(simple_txt)
 
         for i, (score, probs) in zip(simple_idx, scored_simple):
-            bucket = int(round(score * (self.n_buckets - 1)))
+            bucket = max(range(len(probs)), key=probs.__getitem__)
             results[i] = Verdict(
                 score=score,
                 bucket=bucket,
                 label=self.bucket_names[bucket],
                 probs=probs,
-                word_count=count_words(prepared[i]),
-                char_count=len(prepared[i]),
+                word_count=count_words(prepared[i][0]),
+                char_count=len(prepared[i][0]),
                 truncated_windows=1,
+                model_word_count=len(re.findall(r"\b\w+\b", prepared[i][1])),
             )
         return [r for r in results if r is not None]
 

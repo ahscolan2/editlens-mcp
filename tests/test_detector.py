@@ -227,8 +227,8 @@ def test_window_weighting_is_exact(det):
     # The probability vector is combined the same way, and stays a distribution.
     assert abs(v.probs[1] - expected) < 1e-9, (v.probs, expected)
     assert abs(sum(v.probs) - 1.0) < 1e-9, v.probs
-    # And bucket/label still follow from the score.
-    assert v.bucket == int(round(v.score * 3)), (v.bucket, v.score)
+    # The label follows the most probable aggregate bucket.
+    assert v.bucket == max(range(len(v.probs)), key=v.probs.__getitem__), (v.bucket, v.probs)
     assert v.label == det.bucket_names[v.bucket], (v.label, v.bucket)
     print(f"  {len(details)} windows, weights {[int(w) for w in weights]}")
     print(f"  score={v.score:.9f} == weighted {expected:.9f} "

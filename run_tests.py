@@ -1,9 +1,6 @@
 """Run every test suite. Usage:  python run_tests.py
 
-Eleven suites, in the order they run (the SUITES list below is the authority;
-the README's testing table describes each one):
-  smoke, tools, usability, concurrency, offsets, branching, robustness,
-  entrypoints, detector, gpu_memory, client
+The SUITES list below is the authority.
 
 Nothing here may touch the operator's real chain database: EDITLENS_DB is
 forced to a temp path below before any suite runs -- unconditionally, even if
@@ -39,6 +36,9 @@ _RUN_TMP = tempfile.mkdtemp(prefix="editlens-tests-")
 # install" the one command that could touch the real data.
 _test_db = (os.environ.get("EDITLENS_TEST_DB") or "").strip()
 os.environ["EDITLENS_DB"] = _test_db or str(Path(_RUN_TMP) / "run_tests.db")
+# Test clients must neither reuse nor unload an operator's inference worker.
+os.environ["EDITLENS_RUNTIME_DIR"] = str(Path(_RUN_TMP) / "runtime")
+os.environ["PYTHONIOENCODING"] = "utf-8"
 for _var in ("TMPDIR", "TEMP", "TMP"):
     os.environ[_var] = _RUN_TMP
 
@@ -46,6 +46,10 @@ SUITES = [
     ("smoke", [sys.executable, "-u", str(ROOT / "smoke_test.py"), "--real"]),
     ("tools", [sys.executable, "-u", str(ROOT / "tests" / "test_tools.py")]),
     ("usability", [sys.executable, "-u", str(ROOT / "tests" / "test_usability.py")]),
+    ("workflow_contract", [sys.executable, "-u", str(ROOT / "tests" / "test_workflow_contract.py")]),
+    ("store_regressions", [sys.executable, "-u", str(ROOT / "tests" / "test_store_regressions.py")]),
+    ("reference_parity", [sys.executable, "-u", str(ROOT / "tests" / "test_reference_parity.py")]),
+    ("shared_worker", [sys.executable, "-u", str(ROOT / "tests" / "test_shared_worker.py"), "--real"]),
     ("concurrency", [sys.executable, "-u", str(ROOT / "tests" / "test_concurrency.py")]),
     ("offsets", [sys.executable, "-u", str(ROOT / "tests" / "test_offsets.py")]),
     ("branching", [sys.executable, "-u", str(ROOT / "tests" / "test_branching.py")]),

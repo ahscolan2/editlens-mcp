@@ -78,7 +78,7 @@ async def main() -> None:
         # promise: it holds for any number between 0 and 1. These three are the
         # SAME quantity in three forms, and they must stay derivable from one
         # another -- the score is the expected bucket index under the softmax,
-        # normalised to [0,1]; the bucket is that score put back on the index
+        # normalised to [0,1]; the bucket is the largest probability on the index
         # scale; the label is that bucket's name. Without this, mutations that
         # returned the argmax instead of the expectation, scaled the score, or
         # shifted the label by one bucket all passed every suite.
@@ -90,7 +90,7 @@ async def main() -> None:
             assert abs(r["score"] - expected) < 0.002, (
                 f"{tag}: score {r['score']} is not the expectation over probs "
                 f"{r['probs']} ({expected:.4f})")
-            assert r["bucket"] == int(round(r["score"] * (nb - 1))), (
+            assert r["bucket"] == max(range(nb), key=lambda i: r["probs"][i]), (
                 f"{tag}: bucket {r['bucket']} does not match score {r['score']}")
             assert 0 <= r["bucket"] < nb, r["bucket"]
             assert r["label"] == names[r["bucket"]], (
@@ -152,9 +152,9 @@ async def main() -> None:
             assert isinstance(u["reliable"], bool)
             assert u["start"] < u["end"]
             # `reliable` is a claim about this unit, not decoration: the docstring
-            # says units under ~25 words are indicative rather than precise. Only
+            # says units under 75 words are indicative rather than precise. Only
             # asserting isinstance(bool) let "always reliable" pass.
-            assert u["reliable"] == (u["words"] >= 25), (
+            assert u["reliable"] == (u["assessment_word_count"] >= 75), (
                 f"unit {u['unit']}: {u['words']} words but reliable={u['reliable']}")
             # The offsets must slice the caller's own text back out.
             assert (AI + " " + HUMAN)[u["start"]:u["end"]].split() == u["text"].split()
@@ -166,7 +166,7 @@ async def main() -> None:
                                {"text": AI + " " + HUMAN, "top": 50, "min_words": 1})
         assert all_units["unit_count"] == len(all_units["worst_units"])
         assert all_units["unreliable_units"] == sum(
-            1 for u in all_units["worst_units"] if u["words"] < 25), (
+            1 for u in all_units["worst_units"] if u["assessment_word_count"] < 75), (
             all_units["unreliable_units"],
             [u["words"] for u in all_units["worst_units"]])
 
@@ -314,7 +314,8 @@ async def main() -> None:
         assert on_target["is_new_best"] is True
         assert on_target["delta_vs_previous"] is None and on_target["delta_vs_best"] is None
         assert on_target["best_score"] == 0.25
-        assert "target met" in on_target["next_action"].lower(), on_target["next_action"]
+        assert on_target["revision_state"] == "insufficient_length", on_target
+        assert on_target["stop_recommended"] and not on_target["length_sufficient"], on_target
 
         worse = await submit_with(0.4, note="regressed")
         assert worse["step"] == 2 and worse["score"] == 0.4

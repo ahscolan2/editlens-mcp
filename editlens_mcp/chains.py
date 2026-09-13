@@ -46,7 +46,13 @@ def default_db_path() -> Path:
     return (base.expanduser() / "editlens-mcp" / "chains.db").resolve()
 
 
-DEFAULT_DB = default_db_path()
+# Keep the exported default for existing callers, but a malformed path must not
+# prevent the server from importing and reporting its database error. Resolve
+# again when opening a default store, where the caller can catch the failure.
+try:
+    DEFAULT_DB = default_db_path()
+except (OSError, RuntimeError, ValueError):
+    DEFAULT_DB = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chains (
@@ -86,8 +92,8 @@ UNIQUE_STEP_INDEX = (
 
 
 class ChainStore:
-    def __init__(self, path: Path | str = DEFAULT_DB, timeout: float = 30.0) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | str | None = None, timeout: float = 30.0) -> None:
+        self.path = default_db_path() if path is None else Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Re-entrant so a method may call another without self-deadlocking.
         self._lock = threading.RLock()
@@ -212,6 +218,21 @@ class ChainStore:
         with self._lock:
             return self._conn.execute(sql, args).fetchone()
 
+    @contextmanager
+    def _read_snapshot(self):
+        """Keep related reads consistent even when another client commits."""
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                yield self._conn
+                self._conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
     # ------------------------------------------------------------------ chains
 
     def create(
@@ -254,26 +275,29 @@ class ChainStore:
         return json.loads(self.get(chain_id)["segments"])
 
     def list_chains(self, limit: int = 50) -> list[dict]:
-        rows = self._read(
-            """
-            SELECT c.id, c.name, c.goal, c.target_score, c.segments, c.updated_at,
-                   COUNT(s.id) AS steps, MIN(s.score) AS best
-            FROM chains c LEFT JOIN steps s ON s.chain_id = c.id
-            GROUP BY c.id ORDER BY c.updated_at DESC LIMIT ?
-            """,
-            (limit,),
-        )
+        # The two queries must see the same database revision. An instance
+        # lock alone cannot exclude commits from another client's connection.
+        with self._read_snapshot():
+            rows = self._read(
+                """
+                SELECT c.id, c.name, c.goal, c.target_score, c.segments, c.updated_at,
+                       COUNT(s.id) AS steps, MIN(s.score) AS best
+                FROM chains c LEFT JOIN steps s ON s.chain_id = c.id
+                GROUP BY c.id ORDER BY c.updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            )
+            seg_rows = self._read(
+                "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
+                " GROUP BY chain_id, segment",
+                (),
+            )
         # Per-segment bests in one query, merged in Python. `best_score` alone
         # misled: MIN across ALL segments, so a chain with a 0.90 intro and a
         # 0.05 body listed as 0.05 and read as finished. The honest signals are
         # how many declared segments have a draft at target -- counted against
         # the DECLARED list, so an unstarted segment counts as not-at-target
         # rather than silently dropping out of the arithmetic.
-        seg_rows = self._read(
-            "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
-            " GROUP BY chain_id, segment",
-            (),
-        )
         seg_best: dict[str, dict[str, float]] = {}
         for r in seg_rows:
             seg_best.setdefault(r["chain_id"], {})[r["segment"]] = r["seg_best"]
@@ -425,14 +449,27 @@ class ChainStore:
             attempts += 1
             try:
                 with self._write() as conn:
-                    if register_segment:
-                        row = conn.execute(
-                            "SELECT segments FROM chains WHERE id = ?", (chain_id,)
-                        ).fetchone()
-                        if row is None:
+                    # Scoring happens before this transaction. A segment that
+                    # existed at lookup time may have been deleted meanwhile;
+                    # reject that stale submit instead of storing a hidden draft.
+                    row = conn.execute(
+                        "SELECT segments FROM chains WHERE id = ?", (chain_id,)
+                    ).fetchone()
+                    if row is None:
+                        if register_segment:
                             raise KeyError(f"no such chain: {chain_id}")
+                        # Preserve the foreign-key error for an absent chain
+                        # on the non-registering path; server.py translates it.
+                    else:
                         segs = json.loads(row["segments"])
                         if segment not in segs:
+                            if not register_segment:
+                                raise KeyError(
+                                    f"segment '{segment}' is no longer declared by "
+                                    "this chain (deleted while this draft was being "
+                                    "scored; the draft was NOT stored). Declared "
+                                    f"segments: {segs}"
+                                )
                             segs.append(segment)
                             conn.execute(
                                 "UPDATE chains SET segments = ? WHERE id = ?",
@@ -520,7 +557,7 @@ class ChainStore:
         ]
 
     def segment_stats(self, chain_id: str, segment: str) -> dict:
-        with self._lock:
+        with self._read_snapshot():
             best = self.best_step(chain_id, segment)
             latest = self.latest_step(chain_id, segment)
             row = self._read_one(
