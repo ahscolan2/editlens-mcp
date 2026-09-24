@@ -29,7 +29,13 @@ import threading
 import time
 from typing import Any
 
-from .detector import DetectorUnavailable, EditLensDetector, Verdict, warmup_imports
+from .detector import (
+    DetectorUnavailable,
+    EditLensDetector,
+    Verdict,
+    _hf_token_present,
+    warmup_imports,
+)
 
 PROTOCOL_VERSION = 1
 MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -130,6 +136,23 @@ def _write_json(path: Path, value: Any):
             os.unlink(temporary)
 
 
+MAX_LOG_BYTES = 1024 * 1024
+
+
+def _rotate_log(path: Path) -> None:
+    """Bound the worker log: every worker start appended to it forever.
+
+    One previous generation is kept so the last failure survives a restart.
+    Rotation is best effort; on Windows an exiting worker may still hold the
+    file open, and the next start simply tries again.
+    """
+    try:
+        if path.stat().st_size > MAX_LOG_BYTES:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
 def _read_json(path: Path) -> dict:
     with path.open("rb") as source:
         raw = source.read(65537)
@@ -212,6 +235,10 @@ class SharedDetector:
         if self.timeout > 3600:
             raise ValueError("EDITLENS_REQUEST_TIMEOUT must not exceed 3600 seconds")
         self.startup_timeout = _seconds("EDITLENS_STARTUP_TIMEOUT", 60)
+        # Only the worker uses this, but validating it here fails the server at
+        # launch naming the setting, instead of every later call reporting that
+        # the worker "exited during startup".
+        _seconds("EDITLENS_WORKER_IDLE", 600, allow_zero=True)
         self.runtime = runtime_dir()
 
     @property
@@ -267,6 +294,7 @@ class SharedDetector:
         # A file cannot fill and block like an unread PIPE. It never contains
         # RPC bodies or the authentication token.
         log_path = self.runtime / f"{self.key}.log"
+        _rotate_log(log_path)
         with log_path.open("ab") as log:
             child = subprocess.Popen(command, cwd=str(_ROOT), stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=log,
@@ -275,6 +303,12 @@ class SharedDetector:
         # waiter has no ownership role and never terminates the child.
         threading.Thread(target=child.wait, daemon=True, name="editlens-worker-reaper").start()
         return child
+
+    def _source_changed(self) -> bool:
+        try:
+            return _worker_key(self.config) != self.key
+        except OSError:
+            return False  # unreadable source: let the worker report it
 
     def _owner_is_free(self):
         owner = _FileLock(self.runtime / f"{self.key}.owner.lock")
@@ -295,6 +329,17 @@ class SharedDetector:
             available = self._available(deadline - time.monotonic())
             if available:
                 return available
+            if self._source_changed():
+                # A `git pull` while this session runs: a new worker would load
+                # the new source, reject this session's key and exit, so every
+                # call spawned a doomed process and reported only "exited
+                # during startup (code 1)". A worker still running under the
+                # old key is used above; otherwise say what to do.
+                raise DetectorUnavailable(
+                    "EditLens was updated on disk after this MCP session started, so it "
+                    "cannot start a matching inference worker. Restart the MCP client or "
+                    "session to load the new version. Saved chains are unaffected."
+                )
             free = self._owner_is_free()
             if time.monotonic() >= deadline:
                 raise DetectorUnavailable(
@@ -319,6 +364,11 @@ class SharedDetector:
                     )
                 # Exit code zero may be a child that lost the lifetime-lock
                 # race to a worker spawned by a client that died mid-startup.
+                # Forget it, so that if that other worker then dies too, the
+                # free owner lock above can start a replacement instead of
+                # this loop waiting out the whole startup deadline.
+                if child is not None and child.returncode == 0:
+                    child = None
                 time.sleep(min(0.05, max(0, deadline - time.monotonic())))
             raise DetectorUnavailable(
                 "EditLens worker did not become ready in time. Its owner may be busy or "
@@ -328,19 +378,33 @@ class SharedDetector:
         finally:
             startup.close()
 
-    def _call(self, operation: str, **arguments):
+    def _call(self, operation: str, *, start: bool = True, **arguments):
         # Serialize/validate before starting a worker for an invalid request.
         payload = {"operation": operation, "arguments": arguments, "timeout": self.timeout}
         if len(_json_bytes(payload)) > MAX_BODY_BYTES:
             raise ValueError("EditLens request exceeds 8 MiB")
-        record = self._worker()
-        try:
-            status, response = _http(record, "POST", "/rpc", payload, timeout=self.timeout + 1)
-        except (OSError, ValueError, http.client.HTTPException) as exc:
-            raise DetectorUnavailable(
-                f"EditLens worker request failed ({type(exc).__name__}); the request was not replayed. "
-                "A running inference may still finish; a later call can reconnect."
-            ) from exc
+        for attempt in range(2):
+            # start=False only talks to a worker that is already running and
+            # returns None otherwise; it never spawns one.
+            record = self._worker() if start else self._available()
+            if record is None:
+                return None
+            try:
+                status, response = _http(record, "POST", "/rpc", payload, timeout=self.timeout + 1)
+            except (OSError, ValueError, http.client.HTTPException) as exc:
+                raise DetectorUnavailable(
+                    f"EditLens worker request failed ({type(exc).__name__}); the request was not replayed. "
+                    "A running inference may still finish; a later call can reconnect."
+                ) from exc
+            # The one safe retry: a worker that had begun exiting refused the
+            # request before running it (at enqueue, or while failing its
+            # queue at shutdown), so nothing is replayed. Without this, a call
+            # landing in that moment failed although a fresh worker was one
+            # discovery away.
+            if (start and attempt == 0
+                    and response.get("error_type") == WorkerStopping.__name__):
+                continue
+            break
         if status != 200 or response.get("ok") is not True:
             message = str(response.get("error", f"worker returned HTTP {status}"))
             if response.get("error_type") == "ValueError":
@@ -357,18 +421,44 @@ class SharedDetector:
     def detect_many(self, texts, normalise: bool = True):
         return [Verdict(**item) for item in self._call("detect_many", texts=list(texts), normalise=normalise)]
 
-    def info(self):
-        return self._call("info")
+    def _locations(self) -> dict:
+        return {
+            "runtime_dir": str(self.runtime),
+            "worker_log": str(self.runtime / f"{self.key}.log"),
+        }
 
-    def health(self):
-        record = self._worker()
-        status, health = _http(record, "GET", "/health", timeout=min(2, self.timeout))
-        if status != 200:
-            raise DetectorUnavailable("EditLens worker health check failed")
-        return health
+    def info(self):
+        return {**self._call("info"), **self._locations()}
+
+    def offline_info(self) -> dict:
+        """What is known without a worker: configuration, provenance, paths.
+
+        detector_info falls back to this when the worker cannot be started, so
+        the tool people call to diagnose a failure still says where to look.
+        """
+        return {
+            **self.scoring_identity(),
+            "backend": "shared",
+            "worker_pid": None,
+            "loaded": False,
+            "device": self.config["device"] or "auto",
+            "dtype": self.config["dtype"] or "float32",
+            "batch_size": self.batch_size,
+            "idle_unload_seconds": self.idle_unload_seconds,
+            # The first thing to check when a gated download is what failed.
+            "hf_token_present": _hf_token_present(),
+            **self._locations(),
+        }
 
     def unload(self):
-        return self._call("unload")
+        # Never start a worker just to unload it: that imports torch and
+        # creates a CUDA context -- allocating the very memory the caller is
+        # trying to free -- only to report that nothing was loaded.
+        return bool(self._call("unload", start=False))
+
+
+class WorkerStopping(DetectorUnavailable):
+    """The worker refused a request before queueing it: it is starting or exiting."""
 
 
 @dataclass
@@ -405,12 +495,19 @@ class _InferenceService:
         self.consumer = threading.Thread(target=self._consume, daemon=True, name="editlens-inference")
         self.consumer.start()
 
+    def _consumer_alive(self) -> bool:
+        # A dead consumer thread (a BaseException escaping inference) must not
+        # leave a worker that answers health checks while nothing drains the
+        # queue: clients would wait out every request's full timeout.
+        return self.consumer is None or self.consumer.is_alive()
+
     def snapshot(self):
         with self.lock:
+            alive = self._consumer_alive()
             return {
                 "protocol": PROTOCOL_VERSION, "key": self.key, "pid": os.getpid(),
                 "backend": "shared", "worker_pid": os.getpid(),
-                "ready": self.ready, "accepting": self.accepting,
+                "ready": self.ready and alive, "accepting": self.accepting and alive,
                 "pending": self.pending, "active": self.active,
                 "completed": self.completed, "cancelled": self.cancelled,
                 "queue_limit": self.jobs.maxsize,
@@ -420,8 +517,8 @@ class _InferenceService:
     def enqueue(self, operation: str, arguments: dict, timeout: float) -> _Job:
         job = _Job(operation, arguments, time.monotonic() + timeout)
         with self.lock:
-            if not self.ready or not self.accepting:
-                raise DetectorUnavailable("EditLens worker is starting or stopping; retry a later call")
+            if not self.ready or not self.accepting or not self._consumer_alive():
+                raise WorkerStopping("EditLens worker is starting or stopping; retry a later call")
             self.jobs.put_nowait(job)
             self.pending += 1
             self.last_activity = time.monotonic()
@@ -445,6 +542,26 @@ class _InferenceService:
         with self.lock:
             self.accepting = False
             self.stopping.set()
+
+    def fail_queued(self, message: str) -> int:
+        """Answer every job still queued once the consumer has stopped.
+
+        Their HTTP handlers otherwise waited out the full request timeout
+        (300 s by default) for a result nothing would produce.
+        """
+        failed = 0
+        while True:
+            try:
+                job = self.jobs.get_nowait()
+            except queue.Empty:
+                return failed
+            with self.lock:
+                self.pending -= 1
+                self.cancelled += 1
+            job.result = {"ok": False, "error": message, "error_type": WorkerStopping.__name__}
+            job.done.set()
+            self.jobs.task_done()
+            failed += 1
 
     def _execute(self, job: _Job):
         if job.operation == "detect":
@@ -546,7 +663,12 @@ class _RequestHandler(BaseHTTPRequestHandler):
 
     def _authorized(self):
         supplied = self.headers.get("Authorization", "").encode("utf-8")
+        # Defense in depth against DNS rebinding: a browser reaching this port
+        # through an attacker's hostname sends that hostname here. The client
+        # always connects to 127.0.0.1.
+        host = self.headers.get("Host", "").rsplit(":", 1)[0].strip("[]").lower()
         if (self.headers.get("Origin") is not None
+                or host not in {"127.0.0.1", "localhost"}
                 or not hmac.compare_digest(supplied, self.server.authorization)):
             self._reply(401, {"ok": False, "error": "Unauthorized"})
             return False
@@ -654,10 +776,18 @@ def worker_main(argv=None) -> int:
         service.start(detector)
         while not service.stopping.wait(0.25):
             service.expire_if_idle()
+            if not service.consumer.is_alive():
+                # Exit so the next client starts a healthy replacement.
+                print("[editlens] inference thread died; worker exiting", file=sys.stderr)
+                break
         return 0
     finally:
         if service is not None:
             service.stop()
+            if service.consumer is not None:
+                service.consumer.join(5)
+            service.fail_queued("EditLens worker stopped before this request ran; it was not "
+                                "processed. Retry the call.")
         if server is not None:
             server.shutdown()
             server.server_close()

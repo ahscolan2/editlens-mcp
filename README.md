@@ -68,8 +68,11 @@ downloads approximately 1.4 GB of weights into the Hugging Face cache.
 
 For manual installation, create a virtual environment, install the appropriate
 [PyTorch build](https://pytorch.org/get-started/locally/), then install
-`requirements.txt` using that environment's Python. The installer uses the CUDA
-12.6 wheel index on Windows/Linux; macOS wheels include Metal/MPS support.
+`requirements.txt` using that environment's Python. On Windows/Linux the
+installer uses the CUDA 12.6 wheel index when `nvidia-smi` reports an NVIDIA GPU
+and the much smaller CPU wheel otherwise; `EDITLENS_TORCH_INDEX` overrides the
+index (ROCm, another CUDA version, a mirror). macOS wheels include Metal/MPS
+support.
 
 ## Register an MCP client
 
@@ -89,13 +92,22 @@ configuration; substitute the paths printed by the installer:
 
 On macOS/Linux the command is `/path/editlens-mcp/.venv/bin/python`. The launcher
 works from any current directory. It also switches an older client configuration
-that names global Python into this checkout's `.venv`, when one exists. Restart
-existing MCP sessions after upgrading.
+that names global Python into this checkout's `.venv`, when one exists (on
+Windows it stays running as a thin parent, like the venv's own `python.exe`, so
+the client never sees the process it launched exit early).
+
+Restart existing MCP sessions after upgrading. A session that started before the
+checkout changed cannot start a matching worker; its scoring calls say so
+("EditLens was updated on disk after this MCP session started") instead of
+failing obscurely. Saved chains are unaffected.
 
 Call `detector_info` to check `backend`, `worker_pid`, `device`, `dtype`, scoring
-profile, load state and database path. Separate clients with matching settings
-should report the same `worker_pid`. Status starts the worker and imports its
-native runtime but does not load model weights.
+profile, load state, database path, `hf_token_present` (environment variables or
+a stored `hf auth login` token), and the worker's `runtime_dir` and `worker_log`.
+Separate clients with matching settings should report the same `worker_pid`.
+Status starts the worker and imports its native runtime but does not load model
+weights. If the worker cannot start, `detector_info` still returns `ok: false`
+with the error plus everything known locally, including the log path.
 
 ## Model sharing and resource use
 
@@ -114,21 +126,29 @@ create separate workers intentionally. Keep settings aligned across agents.
 
 At most 32 inference requests can wait in the queue. A full queue returns an error.
 Expired queued work is cancelled; an already-running native inference may finish.
-Requests are not replayed automatically. A later call can restart a dead worker.
-An unresponsive worker that still holds its lifetime lock is not replaced by a
-duplicate.
+Requests that may have run are never replayed. The one automatic retry is a
+request refused by a worker that was already exiting, which never ran it; that
+request goes once to a fresh worker. A later call can restart a dead worker. An
+unresponsive worker that still holds its lifetime lock is not replaced by a
+duplicate. Workers accept only loopback requests addressed to `127.0.0.1` or
+`localhost` that carry their token.
 
 By default, weights unload after 300 idle seconds and the worker process exits
 after 600 idle seconds. The model watchdog checks periodically, so unloading can
 lag its threshold by up to 30 seconds. `detector_unload` releases the shared model
 after preceding requests finish; later scoring reloads it. This affects every
-client using that worker. Diagnostics are in the worker runtime's `.log` file.
+client using that worker. It never starts a worker: with none running it simply
+reports that nothing was loaded. Diagnostics are in the worker's `.log` file
+(path in `detector_info`), rotated to `.log.1` once it exceeds 1 MiB.
 
 ## Tools and draft workflow
 
 All 13 tools return structured data; execution failures return
 `{"ok": false, "error": "...", "error_type": "..."}`. Schema validation errors
-may be reported by MCP before the tool executes.
+may be reported by MCP before the tool executes. Tools carry MCP annotations:
+everything is local (`openWorldHint: false`), scoring and reading tools are
+read-only, and only `chain_delete` is marked destructive. Chain and segment
+names must not be blank.
 
 | Tool | Main parameters | Purpose |
 | --- | --- | --- |
@@ -157,7 +177,16 @@ recommends stopping score-driven edits for short input, unchanged drafts, target
 reached, significant regressions, or stalled progress. Review heuristics are less
 than 0.01 improvement over five recent submissions and a review point at eight
 submissions per segment. These are workflow rules, not confidence bounds or hard
-limits; further drafts can still be saved.
+limits; further drafts can still be saved. While other declared segments have no
+draft yet, a finished or short section does not recommend stopping; the advice
+names the sections still to draft. Suggested calls in `next_action` include the
+`chain_id`, so they can be run as written. "Unchanged draft" compares against the
+draft being revised (the `branch_from` step when given), and `delta_vs_parent`
+reports the change against it.
+
+Span analysis (`detect_spans`, `chain_submit` feedback) covers only the text the
+document score uses: a reasoning block up to `</think>` and a discarded leading
+boilerplate line are left out rather than ranked.
 
 For multi-section work, finish the sections and call `chain_assemble` before
 considering more revisions. Inspect the selected drafts for meaning, facts and
@@ -188,8 +217,10 @@ reference preprocessing are outside the scored ranges.
 ## Upgrading existing chains
 
 New chains record a `scoring_profile`. Submitting or assembling under a different
-profile is rejected before inference. Saved text, history and status stay readable.
-Older chains without a profile used whitespace-only preprocessing. Either:
+profile is rejected before inference, and the error names each field that differs
+(for example `emoji_version` after upgrading the `emoji` package). Saved text,
+history and status stay readable. Older chains without a profile used
+whitespace-only preprocessing. Either:
 
 1. Retrieve a chosen draft, create a new chain and submit it under `reference`; or
 2. Set `EDITLENS_PREPROCESS=legacy` and restart the client to resume the old chain.
@@ -204,7 +235,7 @@ environment stable for comparisons. Pin `EDITLENS_REVISION` for custom checkpoin
 | Environment variable | Default / meaning |
 | --- | --- |
 | `EDITLENS_BACKEND` | `shared`; `local` loads within each MCP process. |
-| `EDITLENS_PREPROCESS` | `reference`; `legacy` for old whitespace-only chains. |
+| `EDITLENS_PREPROCESS` | `reference`; `legacy` for old whitespace-only chains. Case-insensitive. |
 | `EDITLENS_CHECKPOINT` | `pangram/editlens_roberta-large` |
 | `EDITLENS_REVISION` | Pinned SHA above for the default checkpoint; otherwise the custom repo default. |
 | `EDITLENS_BASE_MODEL` | `FacebookAI/roberta-large`, tokenizer/adapter fallback. |
@@ -219,9 +250,15 @@ environment stable for comparisons. Pin `EDITLENS_REVISION` for custom checkpoin
 | `EDITLENS_DB` | Platform data directory below. |
 | `EDITLENS_TRANSPORT` | `stdio`; other FastMCP transports need their own deployment/access configuration. |
 | `EDITLENS_USE_CURRENT_PYTHON` | `1` bypasses automatic project `.venv` selection. |
+| `EDITLENS_TORCH_INDEX` | Installer only: PyTorch wheel index URL, overriding the GPU/CPU choice. |
+| `EDITLENS_SUITE_TIMEOUT` | Test runner only: seconds before a hung suite is killed and failed (`1800`). |
 
-Malformed batch-size/model-idle numbers warn and use defaults. Invalid worker
-timeout settings fail with the setting's name. An empty model ID is invalid.
+An empty or whitespace-only value means unset for every setting, because client
+configurations often emit `""` for blank fields. Malformed batch-size/model-idle
+numbers warn and use defaults. Invalid worker timeout settings
+(`EDITLENS_REQUEST_TIMEOUT`, `EDITLENS_STARTUP_TIMEOUT`, `EDITLENS_WORKER_IDLE`)
+fail at server start with the setting's name. An unknown `EDITLENS_PREPROCESS`
+value also fails at start.
 
 | Platform | Default database |
 | --- | --- |
@@ -244,8 +281,13 @@ database failure leaves scoring available; chain tools report the cause and
 On macOS/Linux use `.venv/bin/python run_tests.py`. The runner includes 15 suites:
 MCP tools/subprocesses, guidance, workflow contracts, reference inference, shared
 worker lifecycle, offsets, database races, branching, startup, windowing, precision
-and GPU memory release. GPU checks skip without a GPU; real scoring needs access
-to the checkpoint.
+and GPU memory release. Real scoring needs access to the checkpoint.
+
+`run_tests.py --no-model` runs only the 7 suites that need neither the checkpoint
+nor a GPU; this is what CI runs on Windows, macOS and Linux with Python 3.10 and
+3.13 (`.github/workflows/ci.yml`). Name suites to run a subset, for example
+`run_tests.py tools offsets`. A suite that hangs is killed after
+`EDITLENS_SUITE_TIMEOUT` seconds and reported as failed.
 
 Tests use temporary databases and worker runtimes. `EDITLENS_TEST_DB` is the
 explicit database override. Failed runs retain their scratch directory. The tests

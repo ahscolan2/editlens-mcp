@@ -19,7 +19,22 @@ project_python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else 
 if (__name__ == "__main__" and project_python.exists()
         and os.environ.get("EDITLENS_USE_CURRENT_PYTHON") != "1"
         and os.path.normcase(str(Path(sys.executable).absolute())) != os.path.normcase(str(project_python.absolute()))):
-    os.execv(str(project_python), [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+    argv = [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]]
+    if os.name == "nt":
+        # Windows has no exec: os.execv starts a NEW process and exits this
+        # one immediately with code 0. The MCP client then sees the process
+        # it launched exit while the real server runs on the inherited pipes,
+        # and a client that watches that exit reports a dead server. Stay as a
+        # thin waiting parent instead -- what the venv's own python.exe
+        # launcher already does on Windows -- and pass the exit code through.
+        import subprocess
+
+        try:
+            code = subprocess.call(argv)
+        except KeyboardInterrupt:
+            code = 130
+        raise SystemExit(code)
+    os.execv(argv[0], argv)
 
 sys.path.insert(0, str(ROOT))
 

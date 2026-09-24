@@ -131,7 +131,8 @@ async def main() -> None:
         # numbers are per-segment, so the unqualified instruction reads -- and
         # writes -- another segment in any multi-segment chain.
         na = bad["next_action"]
-        assert f"chain_get_text(segment='main', step={good['step']})" in na, na
+        # chain_id too: it is required, so a suggestion without it cannot run.
+        assert f"chain_get_text(chain_id={rid!r}, segment='main', step={good['step']})" in na, na
         assert f"segment='main', branch_from={good['step']}" in na, na
         assert "do not keep editing this draft" in na.lower(), na
         print(f"  regression 0.04 -> 0.99: names step {good['step']}, "

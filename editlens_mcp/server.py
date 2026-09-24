@@ -19,21 +19,30 @@ from typing import Annotated, Any, Literal
 from fastmcp import FastMCP
 from pydantic import Field
 
+from . import __version__
 from .chains import ChainStore, default_db_path
 from .guidance import SCORE_NOTE, SPAN_NOTE, TARGET_NOTE, length_assessment, revision_progress, submission_advice
+from .preprocessing import reference_text, reference_text_with_map
 from .detector import (
     DetectorUnavailable,
     EditLensDetector,
     clean_text_with_map,
-    count_words,
     map_span,
     split_units_adaptive,
     text_fingerprint,
     warmup_imports,
 )
 
+# MCP tool annotations. Clients use these to decide what needs confirmation:
+# every tool here is local (openWorldHint=False), scoring and reads never
+# change state, and only chain_delete destroys saved drafts.
+_READ_ONLY = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
+_WRITES = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
+           "openWorldHint": False}
+
 mcp = FastMCP(
     name="editlens",
+    version=__version__,
     instructions=(
         "Local document-level estimate of AI editing magnitude. Scores are not probabilities "
         "of AI authorship or writing-quality scores. detect_spans scores fragments independently; "
@@ -81,7 +90,9 @@ DETECTOR_CONFIG = dict(
     batch_size=_env_number("EDITLENS_BATCH_SIZE", 8, int),
     dtype=os.environ.get("EDITLENS_DTYPE") or None,
     idle_unload_seconds=_env_number("EDITLENS_IDLE_UNLOAD", 300.0, float),
-    preprocessing=os.environ.get("EDITLENS_PREPROCESS") or "reference",
+    # Case/whitespace-insensitive, like the other settings: "Legacy" or a
+    # trailing space in a JSON client config is not a different profile.
+    preprocessing=(os.environ.get("EDITLENS_PREPROCESS") or "").strip().lower() or "reference",
 )
 # Direct Python use remains in-process. main() replaces this configuration-only
 # object with the shared adapter before accepting any MCP request.
@@ -161,13 +172,35 @@ def _check_chain_profile(chain) -> None:
     if saved is None and current["preprocessing"] == "legacy":
         return  # pre-profile chains used the whitespace-only scoring path
     if saved != current:
+        # Name what differs. A routine `pip install -U emoji` changes only
+        # emoji_version, and without this the caller could not tell that from
+        # a different checkpoint or preprocessing mode.
+        if saved is None:
+            diff = "this chain predates scoring profiles (legacy whitespace-only scoring)"
+        else:
+            keys = sorted(set(saved) | set(current))
+            diff = "; ".join(
+                f"{k}: chain {saved.get(k)!r}, current {current.get(k)!r}"
+                for k in keys if saved.get(k) != current.get(k)
+            )
         raise ValueError(
-            "This chain was scored with a different or legacy scoring profile. "
+            f"This chain was scored with a different scoring profile ({diff}). "
             "Saved drafts remain available through chain_get_text/history. "
             "Create a new chain and resubmit a chosen draft to use current scoring, "
             "or use EDITLENS_PREPROCESS=legacy for an older whitespace-only chain. "
             "Scores from different pipelines must not be ranked together."
         )
+
+
+def _require_name(value: str, what: str) -> None:
+    """Reject blank chain and segment names.
+
+    A blank segment became a section no listing can show legibly, and advice
+    read "Draft segment '' and call chain_submit(segment='')". Names are kept
+    exactly as given otherwise; they are identifiers, not display text.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{what} must not be empty or whitespace-only")
 
 
 def _fail(exc: Exception) -> dict:
@@ -195,6 +228,44 @@ def _guard(fn):
     return wrapper
 
 
+def _scoreable(
+    text: str, source: str, imap: list[tuple[int, int]], units: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Keep only units inside the region the document score actually uses.
+
+    Reference preprocessing discards a reasoning block up to the first
+    </think> and a leading boilerplate line ("Sure, here is..."), as the
+    upstream pipeline does. Units there were still scored and ranked as
+    "worst spans" although the document score ignores that text -- and a unit
+    lying wholly inside a reasoning block had no model input at all, raising
+    "text is empty after reference preprocessing" and failing the whole
+    detect_spans call, or silently removing all of chain_submit's span
+    feedback, on exactly the drafts reasoning models emit.
+    """
+    if detector.preprocessing != "reference":
+        return [(a, b) for a, b in units if source[a:b].strip()]
+    _, ranges = reference_text_with_map(text)
+    if not ranges:
+        return []
+    lo, hi = ranges[0][0], ranges[-1][1]
+    kept = []
+    for a, b in units:
+        o0, o1 = map_span(imap, a, b, len(text))
+        if o1 <= lo or o0 >= hi:
+            continue  # wholly within text the document score discards
+        # Clip a unit straddling the boundary ("...</think>\n\nFirst sentence.")
+        # so its text and offsets show only what is scored.
+        while a < b and imap[a][0] < lo:
+            a += 1
+        while b > a and imap[b - 1][1] > hi:
+            b -= 1
+        while a < b and source[a].isspace():
+            a += 1
+        if a < b and reference_text(source[a:b]):  # the unit alone must have input
+            kept.append((a, b))
+    return kept
+
+
 def _worst_spans(
     text: str,
     granularity: str = "sentence",
@@ -219,6 +290,7 @@ def _worst_spans(
     units, used = split_units_adaptive(
         source, granularity=granularity, min_words=min_words
     )
+    units = _scoreable(text, source, imap, units)
     meta = {"unit_count": len(units), "above_target_total": 0, "min_words_used": used}
     if len(units) < 2:
         return [], meta
@@ -251,7 +323,7 @@ def _worst_spans(
 # --------------------------------------------------------------------- detector
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def detector_info() -> dict:
     """Report detector status: checkpoint, device, dtype, bucket labels, whether the
@@ -259,7 +331,16 @@ def detector_info() -> dict:
     anything errors."""
     # "ok" on the success path too: _guard supplies it on failure, and a client
     # branching on result["ok"] should not KeyError when nothing went wrong.
-    info = {"ok": True, **detector.info()}
+    try:
+        info = {"ok": True, **detector.info()}
+    except Exception as exc:  # noqa: BLE001 - diagnostics must survive a dead worker
+        # In shared mode info() is an RPC that first starts the worker. When
+        # that fails -- a broken torch install, a startup timeout, a busy
+        # owner -- this tool used to return only the bare error, dropping the
+        # database, runtime and log locations needed to diagnose it. Keep the
+        # failure contract (ok/error/error_type) and add what is known locally.
+        offline = getattr(detector, "offline_info", None)
+        info = {**(offline() if offline else {}), **_fail(exc)}
     info.setdefault("backend", "local")
     info["score_note"] = SCORE_NOTE
     info["reliability_basis"] = "Length only (75-word training floor); not calibrated confidence."
@@ -277,14 +358,16 @@ def detector_info() -> dict:
     return info
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
 @_guard
 def detector_unload() -> dict:
     """Release the model from GPU memory immediately.
 
     Rarely needed -- the model unloads itself after a few minutes idle and
     reloads automatically on the next call. Use this only to free VRAM right now,
-    e.g. before starting a game or another GPU job.
+    e.g. before starting a game or another GPU job. The shared model is used by
+    every MCP session on this machine, so this affects all of them. It never
+    starts an inference worker.
     """
     freed = detector.unload()
     return {
@@ -298,7 +381,7 @@ def detector_unload() -> dict:
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def detect(
     text: Annotated[str, Field(description="The text to score.")],
@@ -345,7 +428,7 @@ def detect(
     return out
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def detect_batch(
     texts: Annotated[list[str], Field(description="Texts to score in a single pass.")],
@@ -384,7 +467,7 @@ def detect_batch(
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def detect_spans(
     text: Annotated[str, Field(description="The text to break apart and score.")],
@@ -408,6 +491,7 @@ def detect_spans(
         units, used = split_units_adaptive(
             source, granularity=granularity, min_words=min_words
         )
+        units = _scoreable(text, source, imap, units)
         if not units:
             return _fail(ValueError("no scoreable units"))
         verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
@@ -456,6 +540,11 @@ def detect_spans(
         out["min_words_used"] = None
         out["granularity_relaxed"] = False
     out["unreliable_units"] = sum(1 for r in rows if not r["reliable"])
+    # The same document-level length flag detect/chain_submit/chain_assemble carry.
+    out["reliable"] = overall.assessment_word_count >= RELIABLE_WORDS
+    note = _short_text_note(overall.assessment_word_count)
+    if note:
+        out["reliability_note"] = note
     out["analysis_note"] = SPAN_NOTE
     out["score_note"] = SCORE_NOTE
     out["scoring_profile"] = _scoring_profile()
@@ -466,7 +555,7 @@ def detect_spans(
 # ------------------------------------------------------------------------ chains
 
 
-@mcp.tool
+@mcp.tool(annotations=_WRITES)
 @_guard
 def chain_create(
     name: Annotated[str, Field(description="Human-readable name for this chain.")],
@@ -486,6 +575,9 @@ def chain_create(
     composing a long document section by section.
     """
     try:
+        _require_name(name, "name")
+        for s in segments or []:
+            _require_name(s, "segment names")
         created = store.create(name, target_score, goal, segments,
                                meta={"scoring_profile": _scoring_profile()})
     except Exception as exc:  # noqa: BLE001
@@ -497,12 +589,13 @@ def chain_create(
         "scoring_profile": _scoring_profile(),
         "target_note": TARGET_NOTE,
         "next_action": (
-            f"Draft segment '{first}' and call chain_submit(segment='{first}')."
+            f"Draft segment {first!r} and call "
+            f"chain_submit(chain_id={created['chain_id']!r}, segment={first!r}, text=...)."
         ),
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=_WRITES)
 @_guard
 def chain_submit(
     chain_id: Annotated[str, Field(description="Chain to append to.")],
@@ -527,7 +620,8 @@ def chain_submit(
     branch_from: Annotated[
         int | None,
         Field(description="Step number this draft was derived from. Use to fork an "
-                          "alternative from an earlier draft instead of the latest one."),
+                          "alternative from an earlier draft instead of the latest one.",
+              ge=1),
     ] = None,
 ) -> dict:
     """Score and save a draft verbatim, returning compact workflow feedback.
@@ -540,6 +634,7 @@ def chain_submit(
     draft as the parent. Never mix scoring profiles within one chain.
     """
     try:
+        _require_name(segment, "segment")
         chain = store.get(chain_id)
         _check_chain_profile(chain)
         segs = json.loads(chain["segments"])
@@ -552,9 +647,16 @@ def chain_submit(
         # pre-scoring reads are seconds stale by insert time and under
         # concurrent submits every racer would otherwise crown itself the best.
         prev = store.latest_step(chain_id, segment)
-        if branch_from is not None and store.get_step(chain_id, segment, branch_from) is None:
-            return _fail(KeyError(f"cannot branch from step {branch_from}: no such step "
-                                  f"in segment '{segment}'"))
+        # The draft this one revises: the branch point when given, else the
+        # latest. Duplicate detection must compare against it -- comparing a
+        # branched draft with the latest step missed an unchanged resubmission
+        # of the branch point and flagged a real revision as "unchanged".
+        parent = prev
+        if branch_from is not None:
+            parent = store.get_step(chain_id, segment, branch_from)
+            if parent is None:
+                return _fail(KeyError(f"cannot branch from step {branch_from}: no such step "
+                                      f"in segment '{segment}'"))
         # Score BEFORE touching the store. Scoring first means a failed submit
         # -- empty text, a CUDA OOM -- writes nothing at all. The segment is
         # then registered inside add_step's OWN transaction (register_segment),
@@ -650,6 +752,9 @@ def chain_submit(
         "delta_vs_previous": round(verdict.score - tx_latest["score"], 4) if tx_latest else None,
         "delta_vs_best": round(verdict.score - prev_best["score"], 4) if prev_best else None,
         "parent_step": branch_from if branch_from is not None else (prev["step_no"] if prev else None),
+        # Against the draft actually revised; after branch_from this differs
+        # from delta_vs_previous, which compares with the segment's latest step.
+        "delta_vs_parent": round(verdict.score - parent["score"], 4) if parent else None,
     }
     # The score itself carries a caveat when there is barely any text to score.
     out["reliable"] = verdict.assessment_word_count >= RELIABLE_WORDS
@@ -690,15 +795,17 @@ def chain_submit(
     out["analysis_note"] = SPAN_NOTE
     out["scoring_profile"] = _scoring_profile()
     out.update(length_assessment(verdict.assessment_word_count))
+    started = store.started_segments(chain_id)
     out.update(submission_advice(
         out, words=verdict.assessment_word_count, segments=segs,
         history=store.history(chain_id, segment, limit=5), regressed=regressed,
-        duplicate=prev is not None and prev["text"] == text,
+        duplicate=parent is not None and parent["text"] == text,
+        unstarted=[s for s in segs if s not in started],
     ))
     return out
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def chain_status(
     chain_id: Annotated[str, Field(description="Chain to inspect.")],
@@ -712,12 +819,19 @@ def chain_status(
     whether the draft you last submitted is the one that will be assembled.
     """
     try:
-        chain = store.get(chain_id)
+        # One snapshot: the per-segment rows, totals and the single-segment
+        # progress below must describe the same database revision.
+        with store.snapshot():
+            chain = store.get(chain_id)
+            segs = json.loads(chain["segments"])
+            stats = [store.segment_stats(chain_id, s) for s in segs]
+            single = None
+            if len(segs) == 1 and stats[0]["steps"]:
+                single = (store.latest_step(chain_id, segs[0]),
+                          store.history(chain_id, segs[0], limit=5))
     except KeyError as exc:
         return _fail(exc)
-    segs = json.loads(chain["segments"])
     target = float(chain["target_score"])
-    stats = [store.segment_stats(chain_id, s) for s in segs]
     for s in stats:
         s["target_met"] = s["best_score"] is not None and s["best_score"] <= target
         s["latest_is_best"] = s["steps"] > 0 and s["latest_step"] == s["best_step"]
@@ -750,8 +864,7 @@ def chain_status(
             f"with segment={unstarted[0]!r}."
         )
     elif len(stats) == 1:
-        latest = store.latest_step(chain_id, segs[0])
-        history = store.history(chain_id, segs[0], limit=5)
+        latest, history = single
         progress = revision_progress(history, latest["step_no"])
         out["revision_progress"] = progress
         if latest["words"] < RELIABLE_WORDS:
@@ -775,7 +888,7 @@ def chain_status(
         # chain_get_text(step='best') covering a list of segments defaults to
         # segment='main' and reads the wrong one.
         recover = "; ".join(
-            f"chain_get_text(segment={s!r}, step='best')" for s in stale
+            f"chain_get_text(chain_id={chain_id!r}, segment={s!r}, step='best')" for s in stale
         )
         out["next_action"] += (
             f" Note: in {stale} your latest draft scores worse than an earlier one; "
@@ -784,7 +897,7 @@ def chain_status(
     return out
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def chain_history(
     chain_id: Annotated[str, Field(description="Chain to read.")],
@@ -809,8 +922,9 @@ def chain_history(
     # from a real segment with no steps yet.
     if segment not in known:
         return _fail(KeyError(f"no such segment '{segment}' in this chain; have {known}"))
-    rows = store.history(chain_id, segment, limit)
-    stats = store.segment_stats(chain_id, segment)
+    with store.snapshot():
+        rows = store.history(chain_id, segment, limit)
+        stats = store.segment_stats(chain_id, segment)
     out = {
         "ok": True,
         "chain_id": chain_id,
@@ -835,14 +949,15 @@ def chain_history(
         out["note"] = (
             f"The best draft of this segment is step {stats['best_step']} "
             f"({stats['best_score']}), which is older than the {len(rows)} step(s) shown. "
-            f"Raise `limit` to see it, chain_get_text(segment={segment!r}, step='best') "
-            f"to read it, or chain_submit(segment={segment!r}, "
-            f"branch_from={stats['best_step']}) to continue from it."
+            f"Raise `limit` to see it, chain_get_text(chain_id={chain_id!r}, "
+            f"segment={segment!r}, step='best') to read it, or "
+            f"chain_submit(chain_id={chain_id!r}, segment={segment!r}, "
+            f"branch_from={stats['best_step']}, text=...) to continue from it."
         )
     return out
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def chain_get_text(
     chain_id: Annotated[str, Field(description="Chain to read from.")],
@@ -869,6 +984,8 @@ def chain_get_text(
         row = store.best_step(chain_id, segment)
     elif step == "latest":
         row = store.latest_step(chain_id, segment)
+    elif int(step) < 1:
+        return _fail(ValueError("step numbers start at 1; use 'best' or 'latest' otherwise"))
     else:
         row = store.get_step(chain_id, segment, int(step))
     if row is None:
@@ -882,19 +999,20 @@ def chain_get_text(
         "label": row["label"],
         "words": row["words"],
         "note": row["note"],
+        "parent_step": row["parent_step"],
         "text": row["text"],
         # This tool is step one of the recovery procedure the instructions
         # describe; without a next_action here the second step (branch_from)
         # lived only in prose the caller may never have seen.
         "next_action": (
             f"Review this saved draft for accuracy, meaning, and voice. If you choose "
-            f"to improve it, use chain_submit(segment={segment!r}, "
-            f"branch_from={row['step_no']}) to record the parent draft."
+            f"to improve it, use chain_submit(chain_id={chain_id!r}, segment={segment!r}, "
+            f"branch_from={row['step_no']}, text=...) to record the parent draft."
         ),
     }
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def chain_assemble(
     chain_id: Annotated[str, Field(description="Chain to assemble.")],
@@ -907,14 +1025,17 @@ def chain_assemble(
     selected drafts for accuracy and meaning before using the assembled text.
     """
     try:
-        chain = store.get(chain_id)
-        _check_chain_profile(chain)
+        # Every segment's draft from one database revision, so a concurrent
+        # delete_segment cannot leave a declared list and drafts that disagree.
+        with store.snapshot():
+            chain = store.get(chain_id)
+            _check_chain_profile(chain)
+            segs = json.loads(chain["segments"])
+            best_rows = [(s, store.best_step(chain_id, s)) for s in segs]
     except KeyError as exc:
         return _fail(exc)
-    segs = json.loads(chain["segments"])
     parts, missing, per_segment = [], [], []
-    for s in segs:
-        row = store.best_step(chain_id, s)
+    for s, row in best_rows:
         if row is None:
             missing.append(s)
             continue
@@ -1003,6 +1124,10 @@ def chain_assemble(
             f"fragment estimates; it cannot identify the cause. Preserve sound content "
             f"and stop if further edits would only chase the number."
         )
+        if short_note:
+            # The met-target branch already carried this; above target is where
+            # a caller is most tempted to rewrite short text to move the number.
+            out["next_action"] = f"CAUTION: {short_note} " + out["next_action"]
     out["score_note"] = SCORE_NOTE
     out["target_note"] = TARGET_NOTE
     out["scoring_profile"] = _scoring_profile()
@@ -1018,7 +1143,7 @@ def chain_assemble(
     return out
 
 
-@mcp.tool
+@mcp.tool(annotations=_READ_ONLY)
 @_guard
 def chain_list(
     limit: Annotated[int, Field(description="Most recent N chains.", ge=1, le=200)] = 25,
@@ -1027,7 +1152,7 @@ def chain_list(
     return {"ok": True, "chains": store.list_chains(limit)}
 
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": False})
 @_guard
 def chain_delete(
     chain_id: Annotated[str, Field(description="Chain to delete permanently.")],
@@ -1043,13 +1168,16 @@ def chain_delete(
     segment. Either way this cannot be undone."""
     try:
         if segment is not None:
-            n = store.delete_segment(chain_id, segment)
+            # A blank segment from an empty form field must not fall through to
+            # anything broader; deleting the whole chain means omitting it.
+            _require_name(segment, "segment (omit it to delete the whole chain)")
+            n, remaining = store.delete_segment(chain_id, segment, with_remaining=True)
             return {
                 "ok": True,
                 "chain_id": chain_id,
                 "segment": segment,
                 "deleted_steps": n,
-                "remaining_segments": store.segments_of(chain_id),
+                "remaining_segments": remaining,
             }
         n = store.delete(chain_id)
     except (KeyError, ValueError) as exc:
@@ -1059,7 +1187,8 @@ def chain_delete(
 
 def main() -> None:
     global detector
-    backend = (os.environ.get("EDITLENS_BACKEND") or "shared").strip().lower()
+    # Blank (including whitespace-only) means unset, like every other setting.
+    backend = (os.environ.get("EDITLENS_BACKEND") or "").strip().lower() or "shared"
     if backend == "shared":
         from .shared import SharedDetector
         detector = SharedDetector(**DETECTOR_CONFIG)
@@ -1074,7 +1203,13 @@ def main() -> None:
     # is what a client config emits for a field the user left blank. Same reason
     # EDITLENS_DEVICE/EDITLENS_DTYPE use `or None` above. A genuinely wrong value
     # still errors, but that message at least quotes what was set.
-    mcp.run(transport=os.environ.get("EDITLENS_TRANSPORT") or "stdio")
+    #
+    # show_banner=False: FastMCP's banner also runs its update check, a
+    # blocking request to pypi.org (up to 2 s) on every server launch. This
+    # server promises local operation, and the banner itself is stderr noise
+    # in every client's MCP log.
+    transport = (os.environ.get("EDITLENS_TRANSPORT") or "").strip() or "stdio"
+    mcp.run(transport=transport, show_banner=False)
 
 
 if __name__ == "__main__":

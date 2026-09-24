@@ -517,6 +517,10 @@ async def main() -> None:
             assert r.get("ok") is False, f"{tool} hid an unexpected failure: {r}"
             assert "simulated" in str(r.get("error", "")).lower(), (tool, r)
             assert r.get("error_type") == "Simulated", (tool, r)
+            if tool == "detector_info":
+                # The diagnostic tool must still say where the data lives when
+                # the detector (in shared mode: the worker) is unreachable.
+                assert r.get("db_path") and "score_note" in r, r
         # And the server is still healthy afterwards.
         assert (await call("chain_status", {"chain_id": cid}))["ok"] is True
         print(f"  {len(probes)} tools turned an unexpected RuntimeError into an "

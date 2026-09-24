@@ -23,9 +23,21 @@ from typing import Sequence
 
 from .preprocessing import LEGACY_VERSION, REFERENCE_VERSION, reference_text_with_map
 
-CHECKPOINT = os.environ.get("EDITLENS_CHECKPOINT", "pangram/editlens_roberta-large")
+def _env_text(name: str, default: str | None) -> str | None:
+    """An env setting where empty or whitespace-only means unset.
+
+    MCP client configs routinely emit `"EDITLENS_CHECKPOINT": ""` for a field
+    the user left blank. Every other EDITLENS_* setting already treats that as
+    unset; taken verbatim here it became an empty model ID that only failed at
+    the first scoring call, with a Hugging Face error naming no setting.
+    """
+    value = (os.environ.get(name) or "").strip()
+    return value or default
+
+
+CHECKPOINT = _env_text("EDITLENS_CHECKPOINT", "pangram/editlens_roberta-large")
 DEFAULT_CHECKPOINT_REVISION = "f93e1ace74528cfb48f337ab2fe946fb71a728cb"
-BASE_MODEL = os.environ.get("EDITLENS_BASE_MODEL", "FacebookAI/roberta-large")
+BASE_MODEL = _env_text("EDITLENS_BASE_MODEL", "FacebookAI/roberta-large")
 MAX_LENGTH = 512
 # Room for <s> and </s>, plus slack. Windows are chosen on the full document's
 # token stream but handed to the model as CHARACTER slices, which get
@@ -96,6 +108,23 @@ def pick_device(torch) -> str:
     if mps is not None and mps.is_available() and mps.is_built():
         return "mps"
     return "cpu"
+
+
+def _hf_token_present() -> bool:
+    """Whether Hugging Face credentials are visible to this process.
+
+    Checking only HF_TOKEN/HUGGING_FACE_HUB_TOKEN reported False for the
+    README's recommended setup, `hf auth login`, which stores the token in the
+    Hugging Face home directory -- steering users to fix a login that worked.
+    """
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    try:
+        from huggingface_hub import get_token  # noqa: PLC0415
+
+        return bool(get_token())
+    except Exception:  # noqa: BLE001 - reporting must never break info()
+        return False
 
 
 def accelerator_of(device: str) -> str:
@@ -245,7 +274,9 @@ def map_span(
     ranges: list[tuple[int, int]], start: int, end: int, original_len: int
 ) -> tuple[int, int]:
     """Translate a [start, end) span over cleaned text into original coordinates."""
-    if not ranges or start >= len(ranges) or end <= start:
+    # start < 0 too: a negative index would silently read from the END of the
+    # map and return an in-bounds span for an out-of-range request.
+    if not ranges or start < 0 or start >= len(ranges) or end <= start:
         return 0, 0
     o_start = ranges[start][0]
     o_end = ranges[min(end, len(ranges)) - 1][1]
@@ -312,15 +343,24 @@ class EditLensDetector:
         preprocessing: str = "reference",
         revision: str | None = None,
     ) -> None:
-        self.checkpoint = checkpoint
-        self.revision = revision or os.environ.get("EDITLENS_REVISION") or (
-            DEFAULT_CHECKPOINT_REVISION if checkpoint == "pangram/editlens_roberta-large" else None
+        if not (checkpoint or "").strip():
+            raise ValueError("EDITLENS_CHECKPOINT (the model ID) must not be empty")
+        if not (base_model or "").strip():
+            raise ValueError("EDITLENS_BASE_MODEL must not be empty")
+        self.checkpoint = checkpoint.strip()
+        base_model = base_model.strip()
+        self.revision = revision or _env_text("EDITLENS_REVISION", None) or (
+            DEFAULT_CHECKPOINT_REVISION if self.checkpoint == "pangram/editlens_roberta-large" else None
         )
         self.base_model = base_model
         self._requested_device = device
         self._requested_dtype = dtype
         if preprocessing not in {"reference", "legacy"}:
-            raise ValueError("preprocessing must be 'reference' or 'legacy'")
+            # Name the setting: this runs at server import, where the bare
+            # parameter name told an operator nothing about what to change.
+            raise ValueError(
+                f"EDITLENS_PREPROCESS must be 'reference' or 'legacy', not {preprocessing!r}"
+            )
         self.preprocessing = preprocessing
         # A batch size below 1 is not a slower configuration, it is a broken one:
         # _score_batch steps `range(0, n, batch_size)`, so 0 raises "range() arg 3
@@ -446,9 +486,7 @@ class EditLensDetector:
             "bucket_names": self.bucket_names,
             "max_length": MAX_LENGTH,
             "batch_size": self.batch_size,
-            "hf_token_present": bool(
-                os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-            ),
+            "hf_token_present": _hf_token_present(),
             "platform": sys.platform,
             "accelerator": accelerator_of(device),
             "device_fallback": self._device_fallback,
@@ -992,8 +1030,18 @@ class EditLensDetector:
 # silently disabling all span feedback. `re` forbids variable-width lookbehind,
 # so boundaries are found with finditer and the following char checked manually.
 _SENT_END = re.compile(r"[.!?][\"'”’)\]]*\s+|[。！？…][」』）】\"'”’)\]]*\s*")
-_SENT_START = re.compile(r"[A-Z0-9\"'“(\[]")
+_SENT_START = re.compile(r"[A-Z0-9\"'“(\[¿¡«„‚‘]")
 _CJK_END = re.compile(r"[。！？…]")
+
+
+def _starts_sentence(ch: str) -> bool:
+    """Plausible first character of a sentence.
+
+    [A-Z] alone missed every sentence opening with an accented or non-Latin
+    capital ("É", "Ü", "Ж", "Ω") and Spanish ¿/¡, so French, German, Spanish,
+    Russian or Greek prose never split and span feedback went dark.
+    """
+    return bool(_SENT_START.match(ch)) or ch.isupper() or ch.isdigit()
 # A boundary is rejected when the "sentence" it would end is just an
 # abbreviation: "Dr. Chen" is not two sentences. Single capitals ("J. Smith")
 # and digit runs ("1. item", "Fig. 3") are handled structurally; the list
@@ -1035,12 +1083,17 @@ def _sentence_spans(text: str) -> list[tuple[int, int]]:
         end = m.end()
         nxt = text[end : end + 1]
         is_cjk = bool(_CJK_END.match(m.group()))
+        if is_cjk and m.group()[0] == "…" and nxt and not _CJK.match(nxt):
+            # "…" is also ordinary Latin punctuation ("Wait…what", "un…believable").
+            # It only bypasses the sentence-start check when CJK follows it;
+            # otherwise the usual rule below decides.
+            is_cjk = False
         if _is_abbreviation(text, m.start()):
             continue
         # A blank line always ends a sentence; otherwise require a plausible
         # start. A CJK terminator IS the plausibility -- the char after it is a
         # Han or kana character that _SENT_START can never match.
-        if not nxt or is_cjk or _SENT_START.match(nxt) or "\n\n" in m.group():
+        if not nxt or is_cjk or _starts_sentence(nxt) or "\n\n" in m.group():
             if text[start:end].strip():
                 spans.append((start, end))
             start = end
