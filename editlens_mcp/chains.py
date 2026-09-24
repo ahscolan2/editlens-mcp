@@ -27,7 +27,9 @@ from typing import Any
 
 def default_db_path() -> Path:
     """Per-platform application-data location for the chain database."""
-    override = os.environ.get("EDITLENS_DB")
+    # Whitespace-only is unset too: Path(" ").resolve() is the current
+    # directory, which SQLite then failed to open as a database file.
+    override = (os.environ.get("EDITLENS_DB") or "").strip()
     if override:
         # MCP client configs are JSON, not a shell: nothing else ever expands
         # `~` or `$HOME`. Taken verbatim, "~/foo.db" creates a directory
@@ -220,8 +222,16 @@ class ChainStore:
 
     @contextmanager
     def _read_snapshot(self):
-        """Keep related reads consistent even when another client commits."""
+        """Keep related reads consistent even when another client commits.
+
+        Re-entrant: inside an open transaction (another snapshot, or a write)
+        the reads already share that transaction's view, and a second BEGIN
+        would fail with "cannot start a transaction within a transaction".
+        """
         with self._lock:
+            if self._conn.in_transaction:
+                yield self._conn
+                return
             self._conn.execute("BEGIN")
             try:
                 yield self._conn
@@ -232,6 +242,15 @@ class ChainStore:
                 except sqlite3.Error:
                     pass
                 raise
+
+    def snapshot(self):
+        """One consistent view for several reads made by a single tool call.
+
+        Without it, a draft committed by another client between two reads
+        made a response contradict itself (a history window reporting itself
+        truncated, and a best step "older than" the steps it listed).
+        """
+        return self._read_snapshot()
 
     # ------------------------------------------------------------------ chains
 
@@ -287,11 +306,26 @@ class ChainStore:
                 """,
                 (limit,),
             )
-            seg_rows = self._read(
-                "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
-                " GROUP BY chain_id, segment",
-                (),
-            )
+            # Only the listed chains: an unfiltered GROUP BY aggregated every
+            # step in the database for a listing of five. Very large direct
+            # listings keep the unfiltered form, which stays under SQLite's
+            # bound-parameter limit on every version.
+            ids = [r["id"] for r in rows]
+            if not ids:
+                seg_rows = []
+            elif len(ids) <= 500:
+                seg_rows = self._read(
+                    "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
+                    f" WHERE chain_id IN ({','.join('?' * len(ids))})"
+                    " GROUP BY chain_id, segment",
+                    tuple(ids),
+                )
+            else:
+                seg_rows = self._read(
+                    "SELECT chain_id, segment, MIN(score) AS seg_best FROM steps"
+                    " GROUP BY chain_id, segment",
+                    (),
+                )
         # Per-segment bests in one query, merged in Python. `best_score` alone
         # misled: MIN across ALL segments, so a chain with a 0.90 intro and a
         # 0.05 body listed as 0.05 and read as finished. The honest signals are
@@ -333,7 +367,7 @@ class ChainStore:
             conn.execute("DELETE FROM chains WHERE id = ?", (chain_id,))
         return n
 
-    def delete_segment(self, chain_id: str, segment: str) -> int:
+    def delete_segment(self, chain_id: str, segment: str, *, with_remaining: bool = False):
         """Remove one segment: its steps and its entry in the declared list.
 
         The escape hatch for a typo'd segment name. Without it, one mistyped
@@ -369,7 +403,10 @@ class ChainStore:
                 "UPDATE chains SET segments = ?, updated_at = ? WHERE id = ?",
                 (json.dumps(segs), time.time(), chain_id),
             )
-        return n
+        # with_remaining: the declared list as this transaction left it. A
+        # separate read afterwards could find the chain deleted by another
+        # client and report a committed deletion as a failure.
+        return (n, segs) if with_remaining else n
 
     def add_segment(self, chain_id: str, segment: str) -> list[str]:
         """Read-modify-write the segment list inside one transaction.
@@ -518,6 +555,15 @@ class ChainStore:
                 if attempts >= 5:
                     raise
                 time.sleep(0.01 * attempts)
+
+    def started_segments(self, chain_id: str) -> set[str]:
+        """Segments of this chain that hold at least one draft."""
+        return {
+            r["segment"]
+            for r in self._read(
+                "SELECT DISTINCT segment FROM steps WHERE chain_id = ?", (chain_id,)
+            )
+        }
 
     def best_step(self, chain_id: str, segment: str) -> sqlite3.Row | None:
         return self._read_one(
