@@ -1,0 +1,56 @@
+name: CI
+
+# Runs every suite that needs neither the gated Hugging Face checkpoint nor a
+# GPU (`run_tests.py --no-model`). Real-model suites stay a local check:
+# `python run_tests.py` on a machine with checkpoint access.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    env:
+      PYTHONIOENCODING: utf-8
+      # Never download the checkpoint, even by accident.
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install PyTorch (CPU)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install torch
+          else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          fi
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Compile all sources
+        run: python -m compileall -q editlens_mcp tests install.py run_server.py run_worker.py run_tests.py smoke_test.py
+      - name: Model-free test suites
+        run: python run_tests.py --no-model

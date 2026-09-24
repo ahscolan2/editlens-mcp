@@ -86,7 +86,7 @@ def test_tool_registration() -> None:
 
     tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
     expected = {
-        "detector_info", "detect", "detect_batch", "detect_spans",
+        "detector_info", "detector_unload", "detect", "detect_batch", "detect_spans",
         "chain_create", "chain_submit", "chain_status", "chain_history",
         "chain_get_text", "chain_assemble", "chain_list", "chain_delete",
     }
@@ -113,7 +113,13 @@ def test_real_model() -> None:
         # in [0,1] together with the matching bucket label; check both.
         assert 0.0 <= v.score <= 1.0, v.score
         assert v.label == det.bucket_names[v.bucket], (v.label, v.bucket)
-        assert v.bucket == round(v.score * (det.n_buckets - 1)), (v.bucket, v.score)
+        # The label is the ARGMAX bucket, not the bucket nearest the expected
+        # index (README, docs/RESEARCH.md): a bimodal distribution such as
+        # [0.45, 0.1, 0.0, 0.45] has score 0.5 but argmax 0. Asserting
+        # round(score * 3) == bucket failed on exactly those valid outputs.
+        assert v.probs[v.bucket] == max(v.probs), (v.bucket, v.probs)
+        expected = sum(i * p for i, p in enumerate(v.probs)) / (det.n_buckets - 1)
+        assert abs(v.score - expected) < 1e-4, (v.score, expected)
         assert abs(sum(v.probs) - 1.0) < 1e-4, v.probs
         print(f"    {name:<10} score={v.score:.3f}  {v.label}")
     batch = det.detect_many([ai, human])

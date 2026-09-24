@@ -19,18 +19,68 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT = "pangram/editlens_roberta-large"
+TORCH_INDEX = {
+    "cuda": "https://download.pytorch.org/whl/cu126",
+    "cpu": "https://download.pytorch.org/whl/cpu",
+}
+
+
+def quote(cmd: list[str]) -> str:
+    """A command line the user can paste, even when a path contains spaces."""
+    if os.name == "nt":
+        return subprocess.list2cmdline(cmd)
+    import shlex  # noqa: PLC0415
+    return shlex.join(cmd)
 
 
 def run(cmd: list[str]) -> int:
-    print(f"\n$ {' '.join(cmd)}", flush=True)
+    print(f"\n$ {quote(cmd)}", flush=True)
     return subprocess.run(cmd).returncode
+
+
+def has_nvidia_gpu() -> bool:
+    """True when an NVIDIA driver is installed and reports a GPU.
+
+    nvidia-smi ships with the driver on Windows and Linux. Newer Windows
+    drivers put it in System32, which is on PATH; older ones did not.
+    """
+    smi = shutil.which("nvidia-smi")
+    if smi is None and os.name == "nt":
+        legacy = Path(os.environ.get("ProgramW6432") or r"C:\Program Files") / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+        smi = str(legacy) if legacy.exists() else None
+    if smi is None:
+        return False
+    try:
+        probe = subprocess.run([smi, "-L"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and "GPU" in probe.stdout
 
 
 def torch_install_cmd() -> list[str]:
     base = [sys.executable, "-m", "pip", "install", "torch"]
     if sys.platform == "darwin":
         return base  # macOS wheels ship Metal support
-    return base + ["--index-url", "https://download.pytorch.org/whl/cu126"]
+    # Escape hatch for other builds (ROCm, a different CUDA version, a mirror).
+    override = (os.environ.get("EDITLENS_TORCH_INDEX") or "").strip()
+    if override:
+        return base + ["--index-url", override]
+    # The CUDA wheel is a ~2.5 GB download that only helps with an NVIDIA GPU;
+    # without one the CPU wheel runs the same model from a fraction of that.
+    return base + ["--index-url", TORCH_INDEX["cuda" if has_nvidia_gpu() else "cpu"]]
+
+
+def hf_command() -> str:
+    """The `hf` CLI installed next to this interpreter, else whatever is on PATH.
+
+    The venv's Scripts/bin directory is not on PATH unless the venv is
+    activated, so shutil.which alone reported a missing command that was
+    installed and working.
+    """
+    local = Path(sys.executable).parent / ("hf.exe" if os.name == "nt" else "hf")
+    if local.exists():
+        return str(local)
+    return shutil.which("hf") or ""
 
 
 def check_torch() -> str | None:
@@ -57,11 +107,12 @@ def check_hf() -> str | None:
         # A HEAD request to an actual file checks the download permission.
         get_hf_file_metadata(hf_hub_url(CHECKPOINT, "config.json"))
     except Exception as exc:  # noqa: BLE001
+        login = quote([hf_command() or "hf", "auth", "login"])
         return (
             f"cannot reach {CHECKPOINT}: {type(exc).__name__}: {exc}\n"
             f"  The checkpoint is GATED. Accept the licence at\n"
             f"    https://huggingface.co/{CHECKPOINT}\n"
-            f"  then run:  hf auth login   (paste a Read token)"
+            f"  then run:  {login}   (paste a Read token)"
         )
     print(f"  {CHECKPOINT}: access OK")
     return None
@@ -130,12 +181,12 @@ def main() -> int:
         print("\nNot ready yet:")
         for p in problems:
             print(f"  - {p}")
-        if shutil.which("hf") is None:
+        if not hf_command():
             print("  - the `hf` command is missing; reinstall huggingface_hub")
         return 1
 
     print("\nReady. Verify with:")
-    print(f"  {sys.executable} {ROOT / 'run_tests.py'}")
+    print(f"  {quote([sys.executable, str(ROOT / 'run_tests.py')])}")
     print("\nMCP client config for this install:\n")
     print(client_config())
     return 0

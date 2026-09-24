@@ -1,6 +1,13 @@
-"""Run every test suite. Usage:  python run_tests.py
+"""Run every test suite. Usage:
 
-The SUITES list below is the authority.
+    python run_tests.py              # all suites (needs the gated checkpoint)
+    python run_tests.py --no-model   # only suites that need no checkpoint/GPU
+    python run_tests.py tools offsets   # just the named suites
+
+The SUITES list below is the authority. `--no-model` is what CI runs: it needs
+neither Hugging Face access nor a GPU. Each suite is killed and counted as
+failed after EDITLENS_SUITE_TIMEOUT seconds (default 1800), so one hung
+subprocess cannot stall the whole run.
 
 Nothing here may touch the operator's real chain database: EDITLENS_DB is
 forced to a temp path below before any suite runs -- unconditionally, even if
@@ -42,30 +49,73 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 for _var in ("TMPDIR", "TEMP", "TMP"):
     os.environ[_var] = _RUN_TMP
 
+
+def _suite(script: str, *args: str) -> list[str]:
+    return [sys.executable, "-u", str(ROOT / script), *args]
+
+
+# (name, command, needs_model). needs_model: loads the gated checkpoint.
 SUITES = [
-    ("smoke", [sys.executable, "-u", str(ROOT / "smoke_test.py"), "--real"]),
-    ("tools", [sys.executable, "-u", str(ROOT / "tests" / "test_tools.py")]),
-    ("usability", [sys.executable, "-u", str(ROOT / "tests" / "test_usability.py")]),
-    ("workflow_contract", [sys.executable, "-u", str(ROOT / "tests" / "test_workflow_contract.py")]),
-    ("store_regressions", [sys.executable, "-u", str(ROOT / "tests" / "test_store_regressions.py")]),
-    ("reference_parity", [sys.executable, "-u", str(ROOT / "tests" / "test_reference_parity.py")]),
-    ("shared_worker", [sys.executable, "-u", str(ROOT / "tests" / "test_shared_worker.py"), "--real"]),
-    ("concurrency", [sys.executable, "-u", str(ROOT / "tests" / "test_concurrency.py")]),
-    ("offsets", [sys.executable, "-u", str(ROOT / "tests" / "test_offsets.py")]),
-    ("branching", [sys.executable, "-u", str(ROOT / "tests" / "test_branching.py")]),
-    ("robustness", [sys.executable, "-u", str(ROOT / "tests" / "test_robustness.py")]),
-    ("entrypoints", [sys.executable, "-u", str(ROOT / "tests" / "test_entrypoints.py")]),
-    ("detector", [sys.executable, "-u", str(ROOT / "tests" / "test_detector.py")]),
-    ("gpu_memory", [sys.executable, "-u", str(ROOT / "tests" / "test_gpu_memory.py")]),
-    ("client", [sys.executable, "-u", str(ROOT / "tests" / "test_client.py")]),
+    ("smoke", _suite("smoke_test.py", "--real"), True),
+    ("tools", _suite("tests/test_tools.py"), True),
+    ("usability", _suite("tests/test_usability.py"), False),
+    ("workflow_contract", _suite("tests/test_workflow_contract.py"), False),
+    ("store_regressions", _suite("tests/test_store_regressions.py"), False),
+    ("reference_parity", _suite("tests/test_reference_parity.py"), True),
+    ("shared_worker", _suite("tests/test_shared_worker.py", "--real"), True),
+    ("concurrency", _suite("tests/test_concurrency.py"), False),
+    ("offsets", _suite("tests/test_offsets.py"), True),
+    ("branching", _suite("tests/test_branching.py"), True),
+    ("robustness", _suite("tests/test_robustness.py"), False),
+    ("entrypoints", _suite("tests/test_entrypoints.py"), True),
+    ("detector", _suite("tests/test_detector.py"), True),
+    ("gpu_memory", _suite("tests/test_gpu_memory.py"), True),
+    ("client", _suite("tests/test_client.py"), True),
 ]
+# Model-free variants of the two suites whose --real half needs the checkpoint.
+NO_MODEL_VARIANTS = {
+    "smoke": _suite("smoke_test.py"),
+    "shared_worker": _suite("tests/test_shared_worker.py"),
+}
+
+
+def select(argv: list[str]) -> list[tuple[str, list[str]]]:
+    no_model = "--no-model" in argv
+    names = [a for a in argv if not a.startswith("-")]
+    known = {name for name, _, _ in SUITES}
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise SystemExit(f"unknown suite(s): {', '.join(unknown)}; have {', '.join(sorted(known))}")
+    chosen = []
+    for name, cmd, needs_model in SUITES:
+        if names and name not in names:
+            continue
+        if no_model:
+            if name in NO_MODEL_VARIANTS:
+                cmd = NO_MODEL_VARIANTS[name]
+            elif needs_model:
+                continue
+        chosen.append((name, cmd))
+    return chosen
+
 
 if __name__ == "__main__":
+    suite_timeout = float(os.environ.get("EDITLENS_SUITE_TIMEOUT") or 1800)
+    try:
+        chosen = select(sys.argv[1:])
+    except SystemExit:
+        shutil.rmtree(_RUN_TMP, ignore_errors=True)
+        raise
     failed = []
     try:
-        for name, cmd in SUITES:
+        for name, cmd in chosen:
             print(f"\n{'=' * 70}\n{name}\n{'=' * 70}", flush=True)
-            if subprocess.run(cmd, cwd=ROOT).returncode != 0:
+            try:
+                code = subprocess.run(cmd, cwd=ROOT, timeout=suite_timeout).returncode
+            except subprocess.TimeoutExpired:
+                print(f"\n{name}: no result after {suite_timeout:.0f} s; killed", flush=True)
+                code = None
+            if code != 0:
                 failed.append(name)
     finally:
         if failed:
@@ -73,5 +123,5 @@ if __name__ == "__main__":
         else:
             shutil.rmtree(_RUN_TMP, ignore_errors=True)
     print(f"\n{'=' * 70}")
-    print(f"FAILED: {', '.join(failed)}" if failed else "ALL SUITES PASSED")
+    print(f"FAILED: {', '.join(failed)}" if failed else f"ALL {len(chosen)} SUITES PASSED")
     sys.exit(1 if failed else 0)
