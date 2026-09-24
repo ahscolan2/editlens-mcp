@@ -29,8 +29,8 @@ sys.path.insert(0, str(ROOT))
 
 from editlens_mcp.detector import DetectorUnavailable, Verdict  # noqa: E402
 from editlens_mcp.shared import (  # noqa: E402
-    MAX_BODY_BYTES, PROTOCOL_VERSION, SharedDetector, _FileLock, _HTTPServer,
-    _InferenceService, _http, _read_json,
+    MAX_BODY_BYTES, MAX_LOG_BYTES, PROTOCOL_VERSION, SharedDetector, WorkerStopping,
+    _FileLock, _HTTPServer, _InferenceService, _http, _read_json, _rotate_log,
 )
 
 REAL = "--real" in sys.argv
@@ -150,6 +150,22 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(self.fake.calls, [])
 
+    def test_foreign_host_header_is_rejected_even_with_the_token(self):
+        # A DNS-rebinding page reaches 127.0.0.1 under its own hostname.
+        for host, expected in (("attacker.example:1234", 401), ("localhost", 200)):
+            with self.subTest(host=host):
+                conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+                try:
+                    conn.putrequest("GET", "/health", skip_host=True)
+                    conn.putheader("Host", host)
+                    conn.putheader("Authorization", "Bearer " + self.record["token"])
+                    conn.endheaders()
+                    response = conn.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, expected)
+                finally:
+                    conn.close()
+
     def test_body_limit_is_enforced_before_reading(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
         try:
@@ -177,8 +193,73 @@ class ServiceTests(unittest.TestCase):
                     self.assertNotEqual(verdict.score, round(verdict.score, 4))
                     self.assertEqual(windows, [])
                     self.assertEqual(len(proxy.detect_many(["a", "b"])), 2)
-                    self.assertEqual(proxy.info()["backend"], "shared")
+                    info = proxy.info()
+                    self.assertEqual(info["backend"], "shared")
+                    self.assertEqual(Path(info["worker_log"]).parent, Path(scratch).resolve())
+                # Unload talks only to an already-running worker.
+                with patch.object(proxy, "_available", return_value=self.record):
                     self.assertTrue(proxy.unload())
+
+    def test_unload_and_offline_info_never_start_a_worker(self):
+        with tempfile.TemporaryDirectory(prefix="editlens-unload-") as scratch:
+            with patch.dict(os.environ, {"EDITLENS_RUNTIME_DIR": scratch}):
+                proxy = SharedDetector()
+                with patch.object(proxy, "_spawn") as spawn, \
+                        patch.object(proxy, "_worker") as worker:
+                    self.assertFalse(proxy.unload())
+                    offline = proxy.offline_info()
+                spawn.assert_not_called()
+                worker.assert_not_called()
+                self.assertIsNone(offline["worker_pid"])
+                self.assertFalse(offline["loaded"])
+                self.assertEqual(offline["checkpoint"], proxy.scoring_identity()["checkpoint"])
+                self.assertTrue(offline["worker_log"].endswith(".log"))
+
+    def test_request_refused_by_an_exiting_worker_is_retried_once(self):
+        with tempfile.TemporaryDirectory(prefix="editlens-stopping-") as scratch:
+            with patch.dict(os.environ, {"EDITLENS_RUNTIME_DIR": scratch}):
+                proxy = SharedDetector()
+                refused = (503, {"ok": False, "error": "stopping", "error_type": "WorkerStopping"})
+                served = (200, {"ok": True, "result": {"loaded": False}})
+                with patch.object(proxy, "_worker", return_value=self.record) as worker, \
+                        patch("editlens_mcp.shared._http", side_effect=[refused, served]) as request:
+                    self.assertFalse(proxy.info()["loaded"])
+                self.assertEqual(worker.call_count, 2)
+                self.assertEqual(request.call_count, 2)
+                # ...but only once: a second refusal is reported, not looped on.
+                with patch.object(proxy, "_worker", return_value=self.record), \
+                        patch("editlens_mcp.shared._http", side_effect=[refused, refused, served]):
+                    with self.assertRaisesRegex(DetectorUnavailable, "stopping"):
+                        proxy.info()
+
+    def test_dead_consumer_is_not_advertised_as_healthy(self):
+        class Fatal(BaseException):
+            pass
+
+        class Dying(FakeDetector):
+            def info(self):
+                raise Fatal("inference thread died")
+
+        service = _InferenceService("dying", idle_seconds=10)
+        service.start(Dying())
+        job = service.enqueue("info", {}, 2)
+        self.assertTrue(job.done.wait(2))
+        service.consumer.join(2)
+        self.assertFalse(service.consumer.is_alive())
+        self.assertFalse(service.snapshot()["ready"])
+        with self.assertRaises(WorkerStopping):
+            service.enqueue("info", {}, 1)
+
+    def test_queued_jobs_are_answered_when_the_worker_stops(self):
+        service = _InferenceService("draining", idle_seconds=10)
+        service.ready = True  # no consumer: jobs stay queued
+        jobs = [service.enqueue("info", {}, 30) for _ in range(2)]
+        service.stop()
+        self.assertEqual(service.fail_queued("stopped"), 2)
+        for job in jobs:
+            self.assertTrue(job.done.is_set())
+            self.assertEqual(job.result["error_type"], "WorkerStopping")
+        self.assertEqual(service.snapshot()["pending"], 0)
 
     def test_transport_failure_never_replays_rpc(self):
         with tempfile.TemporaryDirectory(prefix="editlens-no-replay-") as scratch:
@@ -251,6 +332,36 @@ class CoordinationTests(unittest.TestCase):
                                 proxy.info()
                             spawn.assert_not_called()
 
+    def test_child_that_lost_the_owner_race_can_be_replaced(self):
+        # A child exiting 0 lost the lifetime lock to another worker. If that
+        # worker dies too, the free lock must allow a replacement rather than
+        # waiting out the whole startup deadline.
+        with tempfile.TemporaryDirectory(prefix="editlens-exit-zero-") as scratch:
+            with patch.dict(os.environ, {"EDITLENS_RUNTIME_DIR": scratch,
+                                         "EDITLENS_STARTUP_TIMEOUT": "5"}):
+                proxy = SharedDetector()
+                ready = {"port": 1, "pid": 1, "token": "x" * 32}
+                exited = unittest.mock.Mock(returncode=0)
+                exited.poll.return_value = 0
+                with patch.object(proxy, "_spawn", return_value=exited) as spawn, \
+                        patch.object(proxy, "_owner_is_free", return_value=True), \
+                        patch.object(proxy, "_available",
+                                     side_effect=lambda *_: ready if spawn.call_count >= 2 else None):
+                    started = time.monotonic()
+                    self.assertEqual(proxy._worker(), ready)
+                self.assertEqual(spawn.call_count, 2)
+                self.assertLess(time.monotonic() - started, 4)
+
+    def test_source_updated_after_session_start_is_reported_not_spawned(self):
+        with tempfile.TemporaryDirectory(prefix="editlens-updated-") as scratch:
+            with patch.dict(os.environ, {"EDITLENS_RUNTIME_DIR": scratch}):
+                proxy = SharedDetector()
+                with patch("editlens_mcp.shared._worker_key", return_value="0" * 64):
+                    with patch.object(proxy, "_spawn") as spawn:
+                        with self.assertRaisesRegex(DetectorUnavailable, "Restart the MCP client"):
+                            proxy.detect("text")
+                        spawn.assert_not_called()
+
     def test_symlinked_venvs_keep_their_interpreter_and_separate_workers(self):
         with tempfile.TemporaryDirectory(prefix="editlens-venv-symlink-") as scratch:
             first_path = str(Path(scratch) / "first-venv" / "bin" / "python")
@@ -283,6 +394,27 @@ class CoordinationTests(unittest.TestCase):
                 with patch.dict(os.environ, {"EDITLENS_REQUEST_TIMEOUT": value}):
                     with self.assertRaisesRegex(ValueError, "EDITLENS_REQUEST_TIMEOUT"):
                         SharedDetector()
+
+    def test_invalid_worker_idle_fails_at_client_construction(self):
+        # Before: accepted here, then every call reported only that the
+        # worker "exited during startup".
+        for value in ("-5", "nan", "soon"):
+            with self.subTest(value=value):
+                with patch.dict(os.environ, {"EDITLENS_WORKER_IDLE": value}):
+                    with self.assertRaisesRegex(ValueError, "EDITLENS_WORKER_IDLE"):
+                        SharedDetector()
+
+    def test_worker_log_rotation_keeps_one_previous_generation(self):
+        with tempfile.TemporaryDirectory(prefix="editlens-log-") as scratch:
+            log = Path(scratch) / "k.log"
+            log.write_bytes(b"small")
+            _rotate_log(log)
+            self.assertEqual(log.read_bytes(), b"small")
+            log.write_bytes(b"x" * (MAX_LOG_BYTES + 1))
+            _rotate_log(log)
+            self.assertFalse(log.exists())
+            self.assertEqual((Path(scratch) / "k.log.1").stat().st_size, MAX_LOG_BYTES + 1)
+            _rotate_log(log)  # missing file: no error
 
     def test_file_lock_has_one_owner_and_reuses_same_file(self):
         with tempfile.TemporaryDirectory(prefix="editlens-lock-") as scratch:
