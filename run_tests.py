@@ -34,7 +34,15 @@ ROOT = Path(__file__).resolve().parent
 # tempfile.mkdtemp(), which honours TMPDIR/TEMP/TMP, so pointing those here
 # corrals every scratch database and worktree a suite makes -- ten runs used to
 # leave ~250 orphaned directories in the system temp.
-_RUN_TMP = tempfile.mkdtemp(prefix="editlens-tests-")
+#
+# On macOS it lives under /tmp. The per-user temp dir there is already about
+# 50 characters (/var/folders/xx/.../T/), and the robustness suite's
+# multiprocessing.Manager binds a Unix socket inside TMPDIR: on Python 3.10
+# and 3.11 that overflowed the 104-byte AF_UNIX limit and the suite died with
+# "AF_UNIX path too long". (3.12+ falls back to a short directory itself.)
+_RUN_TMP = tempfile.mkdtemp(
+    prefix="editlens-tests-", dir="/tmp" if sys.platform == "darwin" else None
+)
 
 # The floor, so that no suite -- present or future -- can fall through to
 # default_db_path() and run schema migrations against the operator's live
