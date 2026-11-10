@@ -1,13 +1,15 @@
 """Behavioral regressions for stopping, score provenance, and gated access."""
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 os.environ["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "workflow.db")
 
 from editlens_mcp import server
@@ -167,6 +169,64 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("worst_spans", result)
         self.assertNotIn("above_target", result["next_action"])
 
+    def test_assembled_document_above_target_does_not_recommend_stopping(self):
+        self.cid = server.chain_create(name="two", segments=["a", "b"])["chain_id"]
+        self.score = 0.95
+        self.submit("A draft", segment="a")
+        # Incomplete: never a reason to stop, whatever the score.
+        self.assertFalse(server.chain_assemble(chain_id=self.cid)["stop_recommended"])
+        self.submit("B draft", segment="b")
+        above = server.chain_assemble(chain_id=self.cid)
+        self.assertTrue(above["complete"])
+        self.assertFalse(above["target_met"])
+        # Complete but far above target: next_action asks for a review of the
+        # text, and chain_status reports the same chain as not stopped.
+        self.assertFalse(above["stop_recommended"])
+        self.assertFalse(server.chain_status(chain_id=self.cid)["stop_recommended"])
+        self.score = 0.1
+        self.assertTrue(server.chain_assemble(chain_id=self.cid)["stop_recommended"])
+        # Too short for the score to guide anything: stop on either side.
+        self.words, self.score = 12, 0.95
+        self.assertTrue(server.chain_assemble(chain_id=self.cid)["stop_recommended"])
+
+    def test_target_boundary_is_judged_on_the_reported_score_everywhere(self):
+        self.score = 0.25004  # reported as 0.25, against the default 0.25 target
+        result = self.submit("Boundary draft")
+        self.assertEqual(result["score"], 0.25)
+        self.assertTrue(result["target_met"])
+        status = server.chain_status(chain_id=self.cid)
+        self.assertTrue(status["segments"][0]["target_met"])
+        listed = next(c for c in server.chain_list(limit=200)["chains"]
+                      if c["chain_id"] == self.cid)
+        self.assertEqual(listed["segments_at_target"], 1)
+        assembled = server.chain_assemble(chain_id=self.cid)
+        self.assertTrue(assembled["score_met"] and assembled["target_met"])
+        self.score = 0.25006  # reported as 0.2501: above target in every tool
+        above = self.submit("Just above the target")
+        self.assertEqual(above["score"], 0.2501)
+        self.assertFalse(above["target_met"])
+
+    def test_emoji_package_upgrade_does_not_lock_a_chain(self):
+        self.submit("Existing saved draft")
+        upgraded = dict(server.detector.scoring_identity(), emoji_version="999.0")
+        with patch.object(server.detector, "scoring_identity", return_value=upgraded):
+            self.assertTrue(self.submit("Draft after the upgrade")["ok"])
+            self.assertTrue(server.chain_assemble(chain_id=self.cid)["ok"])
+
+    def test_undeclared_segment_is_rejected_unless_explicitly_added(self):
+        self.cid = server.chain_create(name="sections", segments=["intro", "body"])["chain_id"]
+        typo = self.submit("Draft", segment="Intro")
+        self.assertFalse(typo["ok"])
+        self.assertIn("['intro', 'body']", typo["error"])
+        self.assertIn("new_segment=true", typo["error"])
+        # The default segment name is no exception on a chain declared without it.
+        self.assertFalse(self.submit("Draft")["ok"])
+        self.assertEqual(self.calls, 0, "an undeclared segment must be rejected before scoring")
+        self.assertEqual(server.store.segments_of(self.cid), ["intro", "body"])
+        added = self.submit("Appendix draft", segment="appendix", new_segment=True)
+        self.assertTrue(added["ok"], added)
+        self.assertEqual(server.store.segments_of(self.cid), ["intro", "body", "appendix"])
+
     def test_ranking_uses_full_precision(self):
         verdicts = [Verdict(0.500049, 1, "Lightly AI-edited"),
                     Verdict(0.500041, 1, "Lightly AI-edited")]
@@ -209,14 +269,27 @@ class InstallTests(unittest.TestCase):
                     patch("install.shutil.which", return_value=None):
                 self.assertEqual(install.hf_command(), str(hf))
 
+    def test_launcher_ignores_a_venv_without_the_server_installed(self):
+        import run_server
+        with tempfile.TemporaryDirectory() as scratch:
+            venv = Path(scratch)
+            # An interrupted install: the environment exists, FastMCP does not.
+            self.assertFalse(run_server._venv_is_installed(venv))
+            site = (venv / "Lib" / "site-packages" if os.name == "nt"
+                    else venv / "lib" / "python3.12" / "site-packages")
+            (site / "fastmcp").mkdir(parents=True)
+            self.assertTrue(run_server._venv_is_installed(venv))
+
 
 class SpanAndTextTests(unittest.TestCase):
     def spans(self, text, **kwargs):
         from editlens_mcp.preprocessing import reference_text
 
-        def many(texts, normalise=True):
-            # Every unit sent to the model must have model input.
-            self.assertTrue(all(reference_text(t) for t in texts), texts)
+        def many(texts, normalise=True, fragment=False):
+            # Units are spans of a document: scored as fragments, and every
+            # one must have model input of its own.
+            self.assertTrue(fragment, "span units must be scored as fragments")
+            self.assertTrue(all(reference_text(t, fragment=True) for t in texts), texts)
             return [Verdict(0.3, 1, "Lightly AI-edited", word_count=12) for _ in texts]
 
         overall = (Verdict(0.3, 1, "Lightly AI-edited", word_count=40), [])
@@ -255,6 +328,62 @@ class SpanAndTextTests(unittest.TestCase):
         self.assertEqual(len(_sentence_spans("He paused… Then he left.")), 2)
         self.assertEqual(len(_sentence_spans("待って…何が起きた？")), 2)
 
+    def test_span_fragments_keep_their_first_line(self):
+        from editlens_mcp.preprocessing import reference_text
+        unit = "Here the argument turned ugly.\nTwo members walked out."
+        # As a whole document, the reference drops a leading "Here..." line...
+        self.assertEqual(reference_text(unit), "two members walked out.")
+        # ...but a span of a longer document is scored in full.
+        self.assertEqual(reference_text(unit, fragment=True),
+                         "here the argument turned ugly. two members walked out.")
+        self.assertEqual(reference_text("lead-in</think>Kept TEXT", fragment=True),
+                         "lead-in</think>kept text")
+        _, model_text, ranges = EditLensDetector()._prepare(unit, False, fragment=True)
+        self.assertEqual(len(model_text), len(ranges))
+        self.assertEqual(ranges[0], (0, 1))
+
+    def test_reasoning_block_does_not_stop_the_answer_from_dividing(self):
+        answer = "The cat sat on the mat today. The dog stood by the door."
+        think = ("<think>" + "Step one is to analyze the problem carefully today. " * 6
+                 + "</think>\n\n")
+        alone = self.spans(answer)
+        after_think = self.spans(think + answer)
+        self.assertEqual(alone["unit_count"], 2)
+        # The discarded block's sentences used to satisfy the splitter on
+        # their own, leaving the answer as one unit and no span feedback.
+        self.assertEqual(after_think["unit_count"], 2)
+        self.assertEqual(after_think["min_words_used"], alone["min_words_used"])
+        text = think + answer
+        for unit in after_think["worst_units"]:
+            self.assertNotIn("Step one", unit["text"])
+            self.assertEqual(text[unit["start"]:unit["end"]].strip(), unit["text"].strip())
+
+    def test_sentence_final_words_that_resemble_abbreviations_still_split(self):
+        from editlens_mcp.detector import _sentence_spans
+        for text in ("The answer was no. Then he left the room.",
+                     "We bought apples, pears, etc. Then we left.",
+                     "He arrived at 5 p.m. Dinner was cold."):
+            with self.subTest(text=text):
+                self.assertEqual(len(_sentence_spans(text)), 2)
+        for text in ("See No. 5 on the list for details.",
+                     "They met at 3 p.m. to review the plan.",
+                     "Dr. Chen cited Smith et al. in the report."):
+            with self.subTest(text=text):
+                self.assertEqual(len(_sentence_spans(text)), 1)
+
+    def test_cjk_document_is_not_flagged_short_by_the_model_side_count(self):
+        from editlens_mcp.detector import count_model_words
+        zh = ("人工智能正在改变我们的写作方式。它可以生成流畅的文本，但有时缺乏个性。"
+              "检测工具因此变得重要。") * 10
+        detector = EditLensDetector()
+        detector.windows = lambda text: [(0, len(text), text)]
+        detector._score_batch = lambda texts: [(0.1, [0.7, 0.3, 0, 0]) for _ in texts]
+        verdict, _ = detector.detect(zh)
+        self.assertGreaterEqual(verdict.assessment_word_count, 75)
+        self.assertLess(abs(verdict.word_count - verdict.model_word_count), 5)
+        # Text without CJK still gets the reference regex, unchanged.
+        self.assertEqual(count_model_words("don't stop"), 3)
+
     def test_negative_span_maps_to_nothing(self):
         from editlens_mcp.detector import map_span
         self.assertEqual(map_span([(0, 5), (5, 10), (10, 15)], -2, 2, 15), (0, 0))
@@ -291,6 +420,16 @@ class ConfigTests(unittest.TestCase):
             EditLensDetector(checkpoint="")
         with self.assertRaisesRegex(ValueError, "EDITLENS_PREPROCESS"):
             EditLensDetector(preprocessing="Reference")
+
+    def test_whitespace_device_and_dtype_mean_unset(self):
+        # Read at server import, so it needs a fresh interpreter.
+        code = ("from editlens_mcp import server; "
+                "print(repr(server.DETECTOR_CONFIG['device']), "
+                "repr(server.DETECTOR_CONFIG['dtype']))")
+        env = dict(os.environ, EDITLENS_DEVICE="  ", EDITLENS_DTYPE=" ")
+        result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.stdout.split(), ["None", "None"], result.stderr)
 
 
 if __name__ == "__main__":

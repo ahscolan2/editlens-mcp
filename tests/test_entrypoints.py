@@ -29,8 +29,12 @@ def _run(code: str, env_extra: dict, timeout: float = 300) -> subprocess.Complet
     env = dict(os.environ)
     env["EDITLENS_DB"] = str(Path(tempfile.mkdtemp()) / "case.db")
     env.update(env_extra)
+    # The children print UTF-8 (run_tests.py sets PYTHONIOENCODING). Decoding
+    # with the Windows locale code page instead killed the reader thread on
+    # the model-loading progress bar and left stdout incomplete.
     return subprocess.run([PY, "-c", code], env=env, capture_output=True,
-                          text=True, cwd=str(ROOT), timeout=timeout)
+                          text=True, encoding="utf-8", errors="replace",
+                          cwd=str(ROOT), timeout=timeout)
 
 
 IMPORT_PROBE = (
@@ -326,11 +330,20 @@ def test_install_survives_a_torch_that_raises_oserror():
         "calls = []\n"
         "install.run = lambda cmd: (calls.append(cmd), 0)[1]\n"
         "install.check_hf = lambda: None\n"
+        "def no_venv(*a, **k):\n"
+        "    raise AssertionError('a test must not create a virtual environment')\n"
+        "install.venv.create = no_venv\n"
         "rc = install.main()\n"
         "print('RC', rc)\n"
         "print('INSTALLED_TORCH', any('torch' in c for c in calls))\n"
     )
+    # EDITLENS_USE_CURRENT_PYTHON keeps install.main() on this interpreter.
+    # Without it, any interpreter other than <repo>/.venv took the "create the
+    # project environment" branch: the test built a real, empty .venv inside
+    # the checkout and never reached the torch code it is here to exercise.
+    env = dict(os.environ, EDITLENS_USE_CURRENT_PYTHON="1")
     p = subprocess.run([PY, "-c", harness], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", env=env,
                        cwd=str(ROOT), timeout=600)
     assert "Traceback" not in p.stderr, (
         f"install.py crashed on an unloadable torch:\n{p.stderr[-800:]}")

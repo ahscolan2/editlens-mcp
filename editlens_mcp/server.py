@@ -26,6 +26,7 @@ from .preprocessing import reference_text, reference_text_with_map
 from .detector import (
     DetectorUnavailable,
     EditLensDetector,
+    _env_text,
     clean_text_with_map,
     map_span,
     split_units_adaptive,
@@ -86,9 +87,11 @@ def _env_number(name: str, default, cast):
 
 
 DETECTOR_CONFIG = dict(
-    device=os.environ.get("EDITLENS_DEVICE") or None,
+    # Blank or whitespace-only means unset, as for every other setting: a
+    # device of " " would otherwise fail placement and fall back to the CPU.
+    device=_env_text("EDITLENS_DEVICE", None),
     batch_size=_env_number("EDITLENS_BATCH_SIZE", 8, int),
-    dtype=os.environ.get("EDITLENS_DTYPE") or None,
+    dtype=_env_text("EDITLENS_DTYPE", None),
     idle_unload_seconds=_env_number("EDITLENS_IDLE_UNLOAD", 300.0, float),
     # Case/whitespace-insensitive, like the other settings: "Legacy" or a
     # trailing space in a JSON client config is not a different profile.
@@ -166,19 +169,35 @@ def _scoring_profile() -> dict:
     return detector.scoring_identity()
 
 
+def _meets(score: float, target: float) -> bool:
+    """Whether a score counts as at or below the target.
+
+    Compared at the four decimals every response reports, so the flag always
+    agrees with the numbers beside it and with chain_status and chain_list,
+    which work from stored, rounded scores. At full precision a score of
+    0.25004 read "score 0.25, target 0.25, target_met false".
+    """
+    return round(score, 4) <= target
+
+
+# Recorded for provenance but not compared: a newer `emoji` package only adds
+# names for newer emoji, and treating it as a different scoring pipeline
+# locked every existing chain after a routine dependency upgrade.
+_PROFILE_INFO_ONLY = frozenset({"emoji_version"})
+
+
 def _check_chain_profile(chain) -> None:
     saved = json.loads(chain["meta"] or "{}").get("scoring_profile")
     current = _scoring_profile()
     if saved is None and current["preprocessing"] == "legacy":
         return  # pre-profile chains used the whitespace-only scoring path
-    if saved != current:
-        # Name what differs. A routine `pip install -U emoji` changes only
-        # emoji_version, and without this the caller could not tell that from
-        # a different checkpoint or preprocessing mode.
+    keys = sorted((set(saved or {}) | set(current)) - _PROFILE_INFO_ONLY)
+    if saved is None or any(saved.get(k) != current.get(k) for k in keys):
+        # Name what differs, so a different checkpoint can be told apart from
+        # a different preprocessing mode.
         if saved is None:
             diff = "this chain predates scoring profiles (legacy whitespace-only scoring)"
         else:
-            keys = sorted(set(saved) | set(current))
             diff = "; ".join(
                 f"{k}: chain {saved.get(k)!r}, current {current.get(k)!r}"
                 for k in keys if saved.get(k) != current.get(k)
@@ -228,42 +247,46 @@ def _guard(fn):
     return wrapper
 
 
-def _scoreable(
-    text: str, source: str, imap: list[tuple[int, int]], units: list[tuple[int, int]]
-) -> list[tuple[int, int]]:
-    """Keep only units inside the region the document score actually uses.
+def _span_units(
+    text: str, granularity: str, min_words: int
+) -> tuple[str, list[tuple[int, int]], list[tuple[int, int]], int]:
+    """Split the part of `text` the document score uses into units.
+
+    Returns the cleaned text, its map back to `text`, the unit spans in
+    cleaned-text coordinates, and the merge threshold actually applied.
 
     Reference preprocessing discards a reasoning block up to the first
     </think> and a leading boilerplate line ("Sure, here is..."), as the
-    upstream pipeline does. Units there were still scored and ranked as
-    "worst spans" although the document score ignores that text -- and a unit
-    lying wholly inside a reasoning block had no model input at all, raising
-    "text is empty after reference preprocessing" and failing the whole
-    detect_spans call, or silently removing all of chain_submit's span
-    feedback, on exactly the drafts reasoning models emit.
+    upstream pipeline does. That text is cut away BEFORE splitting, for two
+    reasons: its sentences must not be ranked as "worst spans" when the
+    document score ignores them, and they must not count toward the number of
+    units -- a long reasoning block otherwise satisfies the splitter on its
+    own, and the short answer after it comes back as one undivided unit.
     """
-    if detector.preprocessing != "reference":
-        return [(a, b) for a, b in units if source[a:b].strip()]
-    _, ranges = reference_text_with_map(text)
-    if not ranges:
-        return []
-    lo, hi = ranges[0][0], ranges[-1][1]
-    kept = []
-    for a, b in units:
-        o0, o1 = map_span(imap, a, b, len(text))
-        if o1 <= lo or o0 >= hi:
-            continue  # wholly within text the document score discards
-        # Clip a unit straddling the boundary ("...</think>\n\nFirst sentence.")
-        # so its text and offsets show only what is scored.
-        while a < b and imap[a][0] < lo:
-            a += 1
-        while b > a and imap[b - 1][1] > hi:
-            b -= 1
-        while a < b and source[a].isspace():
-            a += 1
-        if a < b and reference_text(source[a:b]):  # the unit alone must have input
-            kept.append((a, b))
-    return kept
+    source, imap = clean_text_with_map(text)
+    lo, hi = 0, len(source)
+    reference = detector.preprocessing == "reference"
+    if reference:
+        _, ranges = reference_text_with_map(text)
+        if not ranges:
+            return source, imap, [], min_words
+        first, last = ranges[0][0], ranges[-1][1]
+        while lo < hi and imap[lo][0] < first:
+            lo += 1
+        while hi > lo and imap[hi - 1][1] > last:
+            hi -= 1
+        while lo < hi and source[lo].isspace():
+            lo += 1
+    units, used = split_units_adaptive(
+        source[lo:hi], granularity=granularity, min_words=min_words
+    )
+    units = [(a + lo, b + lo) for a, b in units]
+    if reference:
+        # Each unit must have model input of its own once it stands alone.
+        units = [(a, b) for a, b in units if reference_text(source[a:b], fragment=True)]
+    else:
+        units = [(a, b) for a, b in units if source[a:b].strip()]
+    return source, imap, units, used
 
 
 def _worst_spans(
@@ -286,15 +309,13 @@ def _worst_spans(
     never saw are "already at or below target": on a 1548-word document all 36
     units scored above a 0.25 target, and the response named 5.
     """
-    source, imap = clean_text_with_map(text)
-    units, used = split_units_adaptive(
-        source, granularity=granularity, min_words=min_words
-    )
-    units = _scoreable(text, source, imap, units)
+    source, imap, units, used = _span_units(text, granularity, min_words)
     meta = {"unit_count": len(units), "above_target_total": 0, "min_words_used": used}
     if len(units) < 2:
         return [], meta
-    verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
+    verdicts = detector.detect_many(
+        [source[a:b] for a, b in units], normalise=False, fragment=True
+    )
     rows = []
     for (a, b), v in zip(units, verdicts):
         o0, o1 = map_span(imap, a, b, len(text))
@@ -312,7 +333,7 @@ def _worst_spans(
             "text": source[a:b],
         }
         if target is not None:
-            row["above_target"] = v.score > target
+            row["above_target"] = not _meets(v.score, target)
         rows.append(row)
     rows.sort(key=lambda r: r["score"], reverse=True)
     if target is not None:
@@ -487,14 +508,12 @@ def detect_spans(
     The model applies the reported scoring_profile to each unit independently.
     """
     try:
-        source, imap = clean_text_with_map(text)
-        units, used = split_units_adaptive(
-            source, granularity=granularity, min_words=min_words
-        )
-        units = _scoreable(text, source, imap, units)
+        source, imap, units, used = _span_units(text, granularity, min_words)
         if not units:
             return _fail(ValueError("no scoreable units"))
-        verdicts = detector.detect_many([source[a:b] for a, b in units], normalise=False)
+        verdicts = detector.detect_many(
+            [source[a:b] for a, b in units], normalise=False, fragment=True
+        )
         overall, _ = detector.detect(text)
     except (DetectorUnavailable, ValueError) as exc:
         return _fail(exc)
@@ -623,6 +642,12 @@ def chain_submit(
                           "alternative from an earlier draft instead of the latest one.",
               ge=1),
     ] = None,
+    new_segment: Annotated[
+        bool,
+        Field(description="Set true to add `segment` to the chain as a new section. "
+                          "Without it, a segment name the chain does not declare is "
+                          "rejected, so a mistyped name cannot create a section."),
+    ] = False,
 ) -> dict:
     """Score and save a draft verbatim, returning compact workflow feedback.
 
@@ -631,7 +656,8 @@ def chain_submit(
     instructions. next_action and stop_recommended flag short text, regressions,
     unchanged drafts, plateaus and an eight-submission review point. These are
     advisory; every valid submission is stored. branch_from records an earlier
-    draft as the parent. Never mix scoring profiles within one chain.
+    draft as the parent. `segment` must be one the chain declares unless
+    new_segment is true. Never mix scoring profiles within one chain.
     """
     try:
         _require_name(segment, "segment")
@@ -639,6 +665,15 @@ def chain_submit(
         _check_chain_profile(chain)
         segs = json.loads(chain["segments"])
         is_new_segment = segment not in segs
+        if is_new_segment and not new_segment:
+            # Checked before scoring. Registering whatever name arrives turned a
+            # typo ("Intro" for "intro", or the default "main" on a chain
+            # declared with other sections) into a section that left the chain
+            # incomplete until someone noticed and deleted it.
+            return _fail(KeyError(
+                f"no such segment '{segment}' in this chain; have {segs}. "
+                f"Pass new_segment=true to add it as a new section."
+            ))
 
         # The caller-visible previous draft: what the agent was actually
         # revising when it built this submission. Used ONLY for parent_step --
@@ -740,7 +775,7 @@ def chain_submit(
         "model_word_count": verdict.model_word_count if verdict.model_word_count is not None else verdict.word_count,
         "assessment_word_count": verdict.assessment_word_count,
         "target_score": target,
-        "target_met": verdict.score <= target,
+        "target_met": _meets(verdict.score, target),
         "best_score": round(best_score, 4),
         "best_step": best_step,
         "is_new_best": is_new_best,
@@ -1060,6 +1095,7 @@ def chain_assemble(
     # that exist and calling that "target met" invites shipping a draft with a
     # whole section missing.
     complete = not missing
+    score_met = _meets(verdict.score, target)
     out: dict[str, Any] = {
         "ok": True,
         "chain_id": chain_id,
@@ -1069,8 +1105,8 @@ def chain_assemble(
         "model_word_count": verdict.model_word_count if verdict.model_word_count is not None else verdict.word_count,
         "assessment_word_count": verdict.assessment_word_count,
         "target_score": target,
-        "target_met": complete and verdict.score <= target,
-        "score_met": verdict.score <= target,
+        "target_met": complete and score_met,
+        "score_met": score_met,
         "complete": complete,
         "per_segment": per_segment,
         "missing_segments": missing,
@@ -1095,7 +1131,7 @@ def chain_assemble(
             f"Incomplete: draft {missing} with chain_submit, then assemble again. The "
             f"score above covers only the sections that exist."
         )
-    elif verdict.score <= target:
+    elif score_met:
         if short_note:
             out["next_action"] = (
                 f"Document meets target and every segment has a draft -- BUT "
@@ -1132,7 +1168,12 @@ def chain_assemble(
     out["target_note"] = TARGET_NOTE
     out["scoring_profile"] = _scoring_profile()
     out.update(length_assessment(verdict.assessment_word_count))
-    out["stop_recommended"] = complete
+    # Stop score-driven work when the complete document meets the target, or
+    # is too short for its score to guide anything. A complete document above
+    # target is where next_action asks for a review of the text, and
+    # chain_status reports the same state as not stopped; "complete" alone
+    # told the caller to stop at 0.95 against a 0.25 target.
+    out["stop_recommended"] = complete and (score_met or short_note is not None)
     if len(segs) == 1:
         out["note"] = (
             "Single-segment assembly uses the lowest-scoring saved draft, with edge "

@@ -13,12 +13,31 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _venv_is_installed(venv: Path) -> bool:
+    """Whether install.py finished in this environment.
+
+    A `.venv` that exists but holds no FastMCP (an interrupted install, or one
+    some other tool created) cannot run the server. Switching into it would
+    turn a working launch into "No module named 'fastmcp'".
+    """
+    if os.name == "nt":
+        return (venv / "Lib" / "site-packages" / "fastmcp").is_dir()
+    return any((venv / "lib").glob("python*/site-packages/fastmcp"))
+
+
 # Reuse the isolated project environment when a client is still configured with
 # a global Python. Escape hatch for operators intentionally using another venv.
 project_python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-if (__name__ == "__main__" and project_python.exists()
-        and os.environ.get("EDITLENS_USE_CURRENT_PYTHON") != "1"
-        and os.path.normcase(str(Path(sys.executable).absolute())) != os.path.normcase(str(project_python.absolute()))):
+_switch = (__name__ == "__main__" and project_python.exists()
+           and (os.environ.get("EDITLENS_USE_CURRENT_PYTHON") or "").strip() != "1"
+           and os.path.normcase(str(Path(sys.executable).absolute())) != os.path.normcase(str(project_python.absolute())))
+if _switch and not _venv_is_installed(ROOT / ".venv"):
+    print("[editlens] ignoring .venv: FastMCP is not installed in it. Run install.py "
+          "to finish setup; continuing with the current Python.", file=sys.stderr)
+    _switch = False
+if _switch:
     argv = [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]]
     if os.name == "nt":
         # Windows has no exec: os.execv starts a NEW process and exits this
