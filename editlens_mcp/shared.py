@@ -418,8 +418,9 @@ class SharedDetector:
         result = self._call("detect", text=text, normalise=normalise)
         return Verdict(**result["verdict"]), result["windows"]
 
-    def detect_many(self, texts, normalise: bool = True):
-        return [Verdict(**item) for item in self._call("detect_many", texts=list(texts), normalise=normalise)]
+    def detect_many(self, texts, normalise: bool = True, fragment: bool = False):
+        return [Verdict(**item) for item in self._call(
+            "detect_many", texts=list(texts), normalise=normalise, fragment=fragment)]
 
     def _locations(self) -> dict:
         return {
@@ -620,7 +621,9 @@ def _validate_request(payload: dict):
             raise ValueError("this operation takes no arguments")
     elif operation in {"detect", "detect_many"}:
         field_name = "text" if operation == "detect" else "texts"
-        if set(arguments) - {field_name, "normalise"} or field_name not in arguments:
+        # Only span scoring (detect_many) marks its items as fragments.
+        flags = {"normalise"} if operation == "detect" else {"normalise", "fragment"}
+        if set(arguments) - {field_name} - flags or field_name not in arguments:
             raise ValueError("invalid inference arguments")
         value = arguments[field_name]
         if operation == "detect" and not isinstance(value, str):
@@ -629,6 +632,8 @@ def _validate_request(payload: dict):
             raise ValueError("texts must be a list of strings")
         if type(arguments.get("normalise", True)) is not bool:
             raise ValueError("normalise must be a boolean")
+        if type(arguments.get("fragment", False)) is not bool:
+            raise ValueError("fragment must be a boolean")
     else:
         raise ValueError("unknown worker operation")
     timeout = payload.get("timeout", 300)

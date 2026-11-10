@@ -91,7 +91,20 @@ async def main():
         # Independent stdio processes must use the same worker and database.
         # An older client configuration may still name global Python. The
         # launcher must select this checkout's .venv before importing FastMCP.
-        global_python = getattr(sys, "_base_executable", PY)
+        #
+        # That switch exists only when this test itself runs from the project
+        # .venv. From any other interpreter (EDITLENS_USE_CURRENT_PYTHON, a
+        # conda or uv environment) there is nothing to switch to, the base
+        # Python is a different environment, and a worker is keyed by its
+        # interpreter -- so the second frontend uses the same Python and the
+        # check still covers worker sharing.
+        root = Path(SCRIPT).parent
+        project_python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        in_project_venv = (project_python.exists() and os.path.normcase(str(Path(PY).absolute()))
+                           == os.path.normcase(str(project_python.absolute())))
+        global_python = getattr(sys, "_base_executable", PY) if in_project_venv else PY
+        if not in_project_venv:
+            print("not running from the project .venv: launcher switch not exercised")
         other_transport = StdioTransport(command=global_python, args=[SCRIPT], env=env, cwd=workdir)
         async with Client(other_transport) as other:
             other_info = (await other.call_tool("detector_info", {})).data

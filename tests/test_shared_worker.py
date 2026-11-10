@@ -50,6 +50,7 @@ def wait_for(check, timeout=5):
 class FakeDetector:
     def __init__(self):
         self.calls = []
+        self.fragment_flags = []
         self.started = threading.Event()
         self.release = threading.Event()
 
@@ -61,7 +62,8 @@ class FakeDetector:
                 raise RuntimeError("test did not release blocked inference")
         return Verdict(0.123456789, 0, "test", [0.8, 0.1, 0.05, 0.05], 1, len(text)), []
 
-    def detect_many(self, texts, normalise=True):
+    def detect_many(self, texts, normalise=True, fragment=False):
+        self.fragment_flags.append(fragment)
         return [self.detect(text, normalise)[0] for text in texts]
 
     def info(self):
@@ -193,6 +195,13 @@ class ServiceTests(unittest.TestCase):
                     self.assertNotEqual(verdict.score, round(verdict.score, 4))
                     self.assertEqual(windows, [])
                     self.assertEqual(len(proxy.detect_many(["a", "b"])), 2)
+                    # The span flag must cross the wire, and only as a boolean.
+                    self.assertEqual(len(proxy.detect_many(["a"], fragment=True)), 1)
+                    self.assertEqual(self.fake.fragment_flags, [False, True])
+                    status, refused = self.rpc("detect_many", {"texts": ["a"], "fragment": "yes"})
+                    self.assertEqual((status, refused["error_type"]), (400, "ValueError"))
+                    status, refused = self.rpc("detect", {"text": "a", "fragment": True})
+                    self.assertEqual(status, 400)
                     info = proxy.info()
                     self.assertEqual(info["backend"], "shared")
                     self.assertEqual(Path(info["worker_log"]).parent, Path(scratch).resolve())

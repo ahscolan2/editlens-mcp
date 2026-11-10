@@ -16,12 +16,20 @@ BOILERPLATE_STARTS = (
 )
 
 
-def reference_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
+def reference_text_with_map(
+    text: str, fragment: bool = False
+) -> tuple[str, list[tuple[int, int]]]:
     """Apply the official preprocessing, preserving original character ranges.
 
     Preserve the reference's exact ordering and case-sensitive header check.
     Its think-tag operation takes split('</think>')[1], including the unusual
     behavior of discarding text after a *second* closing tag.
+
+    `fragment=True` is for a span cut out of a longer document. The think-tag
+    and leading-header rules describe a whole model response, so applying
+    them to a fragment would drop the first line of any multi-line span that
+    happens to begin with "Here" or "Title". A fragment gets only the emoji,
+    case and whitespace steps.
     """
     import emoji  # noqa: PLC0415 - legacy mode does not need this dependency
 
@@ -50,7 +58,7 @@ def reference_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
         current, ranges = current[left:right], ranges[left:right]
 
     tag = "</think>"
-    first = current.find(tag)
+    first = -1 if fragment else current.find(tag)
     if first >= 0:
         begin = first + len(tag)
         second = current.find(tag, begin)
@@ -58,7 +66,9 @@ def reference_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
         current, ranges = current[begin:end], ranges[begin:end]
         strip()
 
-    paragraphs = [m for m in re.finditer(r"[^\n]+", current) if m.group().strip()]
+    paragraphs = [] if fragment else [
+        m for m in re.finditer(r"[^\n]+", current) if m.group().strip()
+    ]
     if paragraphs:
         first_paragraph = re.sub(r"^[^a-zA-Z0-9]*", "", paragraphs[0].group())
         first_paragraph = emoji.replace_emoji(first_paragraph, "")
@@ -97,6 +107,6 @@ def reference_text_with_map(text: str) -> tuple[str, list[tuple[int, int]]]:
     return current, ranges
 
 
-def reference_text(text: str) -> str:
+def reference_text(text: str, fragment: bool = False) -> str:
     """Return model text without changing the original document."""
-    return reference_text_with_map(text)[0]
+    return reference_text_with_map(text, fragment)[0]

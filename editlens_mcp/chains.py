@@ -340,8 +340,10 @@ class ChainStore:
             declared = json.loads(r["segments"])
             bests = seg_best.get(r["id"], {})
             target = float(r["target_score"])
+            # Rounded like every score a caller is shown, so this count agrees
+            # with the target_met flags of chain_submit and chain_status.
             at_target = sum(
-                1 for s in declared if s in bests and bests[s] <= target
+                1 for s in declared if s in bests and round(bests[s], 4) <= target
             )
             out.append({
                 "chain_id": r["id"],

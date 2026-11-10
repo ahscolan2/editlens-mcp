@@ -27,12 +27,25 @@ blocks, lowercases, and collapses whitespace. This happens to a separate model
 input; saved drafts retain their original text. The default checkpoint is pinned
 to revision `f93e1ace74528cfb48f337ab2fe946fb71a728cb`.
 
+Two of those reference rules can surprise you, because they remove text from
+what is scored without changing what is saved:
+
+- If a document has more than one line and its first line starts with `Sure`,
+  `Here`, `Abstract`, `Title`, `Certainly` or `I'm happy to help`
+  (case-sensitive), that first line is not scored.
+- If the text contains `</think>` anywhere, only what follows the first one
+  (up to a second one) is scored.
+
+`model_word_count` reports how many words actually reached the model, so a value
+well below `word_count` means one of these rules applied.
+
 The reference training configuration uses a 75-word minimum. Responses include
 `length_sufficient`, `assessment` and `calibrated=false`. The retained `reliable`
 field is an alias for the length check only. It is **not confidence**. The server
 uses the smaller of the original readable-word count and the model-input count
 as `assessment_word_count`, so removed headers and expanded emoji/contractions
-cannot inflate it. This conservative check extends the training filter. Language and domain shifts remain
+cannot inflate it. Both counts allow about two Chinese or Japanese characters per
+word. This conservative check extends the training filter. Language and domain shifts remain
 unvalidated; the text utilities' ability to split CJK text is not evidence of model
 accuracy on it.
 
@@ -92,7 +105,8 @@ configuration; substitute the paths printed by the installer:
 
 On macOS/Linux the command is `/path/editlens-mcp/.venv/bin/python`. The launcher
 works from any current directory. It also switches an older client configuration
-that names global Python into this checkout's `.venv`, when one exists (on
+that names global Python into this checkout's `.venv`, when one exists and has
+the server's dependencies installed (on
 Windows it stays running as a thin parent, like the venv's own `python.exe`, so
 the client never sees the process it launched exit early).
 
@@ -148,7 +162,9 @@ All 13 tools return structured data; execution failures return
 may be reported by MCP before the tool executes. Tools carry MCP annotations:
 everything is local (`openWorldHint: false`), scoring and reading tools are
 read-only, and only `chain_delete` is marked destructive. Chain and segment
-names must not be blank.
+names must not be blank. `chain_submit` rejects a segment name the chain does not
+declare, listing the declared ones, unless `new_segment=true` adds it on purpose;
+a mistyped name therefore cannot create a section.
 
 | Tool | Main parameters | Purpose |
 | --- | --- | --- |
@@ -158,7 +174,7 @@ names must not be blank.
 | `detector_info` | — | Diagnose model, worker, environment and database state. |
 | `detector_unload` | — | Release shared model weights. |
 | `chain_create` | `name`, `target_score=0.25`, `goal=null`, `segments=null` | Create a chain; default segment is `main`. |
-| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `span_top=5`, `span_min_words=25`, `branch_from=null` | Score and save the exact draft; return changes and review guidance. |
+| `chain_submit` | `chain_id`, `text`, `segment="main"`, `note=null`, `span_feedback=true`, `span_top=5`, `span_min_words=25`, `branch_from=null`, `new_segment=false` | Score and save the exact draft; return changes and review guidance. |
 | `chain_status` | `chain_id` | Inspect best/latest scores, unstarted segments and suggested review. |
 | `chain_history` | `chain_id`, `segment="main"`, `limit=30` | Recent steps oldest-first, plus whole-segment best/total metadata. |
 | `chain_get_text` | `chain_id`, `segment="main"`, `step="best"` | Retrieve exact text; accepts `best`, `latest` or a step number. |
@@ -170,6 +186,11 @@ names must not be blank.
 edge whitespace and inserts the separator; `chain_get_text` preserves saved drafts
 exactly. Assembly's `target_met` also requires every declared segment to have a
 draft. A target is a workflow setting, not a calibrated authorship boundary.
+Every tool compares the target with the score as reported, to four decimals, so
+`target_met` never disagrees with the numbers beside it or between tools.
+`chain_assemble` sets `stop_recommended` when the complete document meets the
+target or is too short to assess; a complete document above target does not
+recommend stopping, and neither does an incomplete one.
 
 Review writing for concrete problems before revising. `chain_submit` returns
 `revision_state`, `stop_recommended`, `revision_progress` and `next_action`. It
@@ -186,7 +207,9 @@ reports the change against it.
 
 Span analysis (`detect_spans`, `chain_submit` feedback) covers only the text the
 document score uses: a reasoning block up to `</think>` and a discarded leading
-boilerplate line are left out rather than ranked.
+boilerplate line are left out rather than ranked. Units are split from that
+scored text alone, and each unit is scored as a fragment: the whole-document
+header and think-tag rules are not applied to it a second time.
 
 For multi-section work, finish the sections and call `chain_assemble` before
 considering more revisions. Inspect the selected drafts for meaning, facts and
@@ -218,7 +241,9 @@ reference preprocessing are outside the scored ranges.
 
 New chains record a `scoring_profile`. Submitting or assembling under a different
 profile is rejected before inference, and the error names each field that differs
-(for example `emoji_version` after upgrading the `emoji` package). Saved text,
+(for example `preprocessing` or `checkpoint_revision`). `emoji_version` is
+recorded for provenance but is not compared, so upgrading the `emoji` package
+does not lock existing chains. Saved text,
 history and status stay readable. Older chains without a profile used
 whitespace-only preprocessing. Either:
 
@@ -289,8 +314,9 @@ nor a GPU; this is what CI runs on Windows, macOS and Linux with Python 3.10 and
 `run_tests.py tools offsets`. A suite that hangs is killed after
 `EDITLENS_SUITE_TIMEOUT` seconds and reported as failed.
 
-Tests use temporary databases and worker runtimes. `EDITLENS_TEST_DB` is the
-explicit database override. Failed runs retain their scratch directory. The tests
+Tests use temporary databases and worker runtimes, and create nothing inside the
+checkout; they can be run from another interpreter that has the dependencies.
+`EDITLENS_TEST_DB` is the explicit database override. Failed runs retain their scratch directory. The tests
 establish software behavior and reference parity, not detector accuracy. Real
 hardware verification has been on Windows with an RTX 2080; native macOS/Linux
 verification has not been performed in this repair.

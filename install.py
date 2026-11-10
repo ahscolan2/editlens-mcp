@@ -148,7 +148,7 @@ def main() -> int:
         )
         return 1
     project_python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    if (os.environ.get("EDITLENS_USE_CURRENT_PYTHON") != "1"
+    if ((os.environ.get("EDITLENS_USE_CURRENT_PYTHON") or "").strip() != "1"
             and os.path.normcase(str(Path(sys.executable).absolute()))
             != os.path.normcase(str(project_python.absolute()))):
         if not project_python.exists():

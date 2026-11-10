@@ -108,7 +108,7 @@ def select(argv: list[str]) -> list[tuple[str, list[str]]]:
 
 
 if __name__ == "__main__":
-    suite_timeout = float(os.environ.get("EDITLENS_SUITE_TIMEOUT") or 1800)
+    suite_timeout = float((os.environ.get("EDITLENS_SUITE_TIMEOUT") or "").strip() or 1800)
     try:
         chosen = select(sys.argv[1:])
     except SystemExit:

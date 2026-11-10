@@ -329,6 +329,23 @@ def count_words(text: str) -> int:
     return len(_WORD.findall(text))
 
 
+_REFERENCE_WORD = re.compile(r"\b\w+\b")
+
+
+def count_model_words(text: str) -> int:
+    """Word count of the model input, with the reference's `\\b\\w+\\b` regex.
+
+    CJK characters get the same per-character allowance as count_words. The
+    bare regex reads an unspaced clause as one word, and because the length
+    check takes the smaller of the two counts, that made every Chinese or
+    Japanese document look far shorter than it is.
+    """
+    cjk = len(_CJK.findall(text))
+    if cjk:
+        return len(_REFERENCE_WORD.findall(_CJK.sub(" ", text))) + max(1, round(cjk / 2))
+    return len(_REFERENCE_WORD.findall(text))
+
+
 class EditLensDetector:
     """Thread-safe lazy wrapper around the local checkpoint."""
 
@@ -874,7 +891,7 @@ class EditLensDetector:
         return spans
 
     def _prepare(
-        self, text: str, normalise: bool
+        self, text: str, normalise: bool, fragment: bool = False
     ) -> tuple[str, str, list[tuple[int, int]]]:
         """Return display text, model text, and model-to-display ranges.
 
@@ -882,6 +899,9 @@ class EditLensDetector:
         display cleanup first would change the reference's header decisions for
         CR-only documents. The inverse display map retains the established
         detect() offset contract without changing what reaches the model.
+
+        `fragment=True` marks a span of a longer document, which skips the
+        reference's whole-document rules (see reference_text_with_map).
         """
         if normalise:
             source, display_ranges = clean_text_with_map(text)
@@ -891,7 +911,7 @@ class EditLensDetector:
             raise ValueError("empty text")
         if self.preprocessing == "legacy":
             return source, source, [(i, i + 1) for i in range(len(source))]
-        model_text, ranges = reference_text_with_map(text)
+        model_text, ranges = reference_text_with_map(text, fragment)
         if not model_text:
             raise ValueError("text is empty after reference preprocessing")
         if normalise:
@@ -923,9 +943,11 @@ class EditLensDetector:
         owned[-1] = (owned[-1][0], max(owned[-1][1], spans[-1][1], text_len))
         return owned
 
-    def detect(self, text: str, normalise: bool = True) -> tuple[Verdict, list[dict]]:
+    def detect(
+        self, text: str, normalise: bool = True, fragment: bool = False
+    ) -> tuple[Verdict, list[dict]]:
         """Score a document. Long inputs are windowed and length-weighted."""
-        source, model_text, ranges = self._prepare(text, normalise)
+        source, model_text, ranges = self._prepare(text, normalise, fragment)
 
         with self._active():
             model_spans = self.windows(model_text)
@@ -977,19 +999,22 @@ class EditLensDetector:
             word_count=count_words(source),
             char_count=len(source),
             truncated_windows=len(spans),
-            model_word_count=len(re.findall(r"\b\w+\b", model_text)),
+            model_word_count=count_model_words(model_text),
         )
         return verdict, details
 
-    def detect_many(self, texts: Sequence[str], normalise: bool = True) -> list[Verdict]:
+    def detect_many(
+        self, texts: Sequence[str], normalise: bool = True, fragment: bool = False
+    ) -> list[Verdict]:
         """Short-text fast path: one batched forward pass for the whole list.
 
         Any item too long for a single window falls back to windowed scoring.
+        `fragment=True` scores each item as a span of a longer document.
         """
         prepared = []
         for i, text in enumerate(texts):
             try:
-                prepared.append(self._prepare(text, normalise))
+                prepared.append(self._prepare(text, normalise, fragment))
             except ValueError as exc:
                 raise ValueError(f"item {i}: {exc}") from exc
         simple_idx: list[int] = []
@@ -1005,7 +1030,9 @@ class EditLensDetector:
                     simple_idx.append(i)
                     simple_txt.append(model_text)
                 else:
-                    results[i], _ = self.detect(texts[i], normalise=normalise)
+                    results[i], _ = self.detect(
+                        texts[i], normalise=normalise, fragment=fragment
+                    )
             scored_simple = self._score_batch(simple_txt)
 
         for i, (score, probs) in zip(simple_idx, scored_simple):
@@ -1018,7 +1045,7 @@ class EditLensDetector:
                 word_count=count_words(prepared[i][0]),
                 char_count=len(prepared[i][0]),
                 truncated_windows=1,
-                model_word_count=len(re.findall(r"\b\w+\b", prepared[i][1])),
+                model_word_count=count_model_words(prepared[i][1]),
             )
         return [r for r in results if r is not None]
 
@@ -1045,11 +1072,24 @@ def _starts_sentence(ch: str) -> bool:
 # A boundary is rejected when the "sentence" it would end is just an
 # abbreviation: "Dr. Chen" is not two sentences. Single capitals ("J. Smith")
 # and digit runs ("1. item", "Fig. 3") are handled structurally; the list
-# covers the common English title/latin abbreviations.
+# covers abbreviations that label what follows them, so they do not end a
+# sentence even before a capital.
+#
+# "etc.", "a.m." and "p.m." are deliberately absent: they routinely end a
+# sentence, and the caller only splits before a plausible sentence start, so
+# "at 3 p.m. to review" stays whole anyway.
+#
+# Known limits: a single capital that really ends a sentence ("plan B. Then")
+# and "the U.S. Her brother" are not split, because initials and "U.S. Army"
+# look identical and are far more common.
 _ABBREV = {
-    "dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "vs", "etc", "al",
-    "e.g", "i.e", "u.s", "u.k", "a.m", "p.m", "fig", "no", "vol", "cf", "ca",
+    "dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "vs", "al",
+    "e.g", "i.e", "u.s", "u.k", "fig", "vol", "cf", "ca",
 }
+# "No. 5" is an abbreviation; "The answer was no. Then he left." is not. Only
+# a following number tells them apart.
+_ABBREV_BEFORE_NUMBER = {"no"}
+_NUMBER_NEXT = re.compile(r"[\"'”’)\]]*\s*\d")
 _LAST_TOKEN = re.compile(r"[\w.'’-]+$")
 
 
@@ -1066,6 +1106,8 @@ def _is_abbreviation(text: str, terminator_at: int) -> bool:
     low = word.lower()
     if low in _ABBREV or (len(word) == 1 and word.isalpha()):  # "Dr.", "J. Smith"
         return True
+    if low in _ABBREV_BEFORE_NUMBER:
+        return bool(_NUMBER_NEXT.match(text, terminator_at + 1))
     if word.isdigit():
         # A digit run is a LIST MARKER only at the start of a line ("1. item",
         # " 2. next"). Mid-line, a number before a full stop is just how prose
